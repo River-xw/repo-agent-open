@@ -1,0 +1,94 @@
+from utils.repo import clone_repo, pull_repo
+from agents.wiki_agent import WikiAgent
+from config import CONFIG
+
+
+def get_input() -> tuple[str, str]:
+    """Get user input for the mode and repository name.
+
+    Returns:
+        tuple[str, str]: A tuple containing the mode and repository name.
+    """
+    mode = ""
+    repo_name = ""
+    while (mode is None) or (mode not in ["generate", "ask"]):
+        user_input = input(
+            'Choose mode: \nPrint "1" if you want to Generate Wiki Files\nPrint "2" if you want to Ask questions about Wiki Repo\n'
+        )
+        match user_input:
+            case "1":
+                mode = "generate"
+            case "2":
+                mode = "ask"
+            case _:
+                print("Invalid input. Please enter '1' or '2'.")
+    while repo_name == "":
+        user_input = input(
+            'Enter the repository name (such as "github:facebook/zstd"): '
+        )
+        repo_name = user_input.strip()
+    return mode, repo_name
+
+
+def preprocess_repo(repo_name: str) -> tuple[str, str, str, str]:
+    """Preprocess the repository name and ensure it is cloned and up to date.
+
+    Args:
+        repo_name (str): The repository name in the format "platform:owner/repo".
+
+    Returns:
+        tuple[str, str, str, str]: A tuple containing the platform, owner, repo, and repo_path.
+    """
+    # repo_name = repo_name.replace(" ", "")
+    platform, full_repo = repo_name.split(":")
+    owner, repo = full_repo.split("/")
+    repo_path = f"./.repos/{owner}_{repo}"
+    clone_result = clone_repo(platform=platform, owner=owner, repo=repo, dest=repo_path)
+    if clone_result:
+        print(f"Cloned repository {repo_name} to {repo_path}.")
+    else:
+        print(f"Repository {repo_name} already exists. Pulling latest changes...")
+        pull_result = pull_repo(
+            platform=platform, owner=owner, repo=repo, dest=repo_path
+        )
+        if pull_result:
+            print(f"Pulled latest changes for repository {repo_name}.")
+        else:
+            print(f"Failed to pull latest changes for repository {repo_name}.")
+
+    return platform, owner, repo, repo_path
+
+
+def main():
+    # 1.1 check mode for user input (generate wiki files or ask for repo)
+    # 1.2 user input (get repo name or url)
+    print("Welcome to the Wiki Agent!")
+    CONFIG.display()
+    mode, repo_name = get_input()
+    print(f"Mode: {mode}, Repository: {repo_name}")
+
+    # 2.1 check if repo exists locally, if not, clone it
+    platform, owner, repo, repo_path = preprocess_repo(repo_name)
+
+    # 3.1 check if wiki files have been generated, if not, generate them
+    # TODO: implement generate wiki logic
+    # 3.2 if exist, check if they are up to date, if not, update them
+    # TODO: implement update wiki logic
+    # TODO: implement saving wiki files to vector database
+    wiki_path = f"./.wikis/{owner}_{repo}"
+    # wiki_agent initialization
+    wiki_agent = WikiAgent(repo_path=repo_path, wiki_path=wiki_path)
+    wiki_agent.generate()
+
+    match mode:
+        case "generate":
+            print("Wiki generation completed. Exiting.")
+            return
+        case "ask":
+            print("Entering Q&A mode. Type 'exit' to quit.")
+            # TODO: implement question answering logic here
+            wiki_agent.ask("What is this repo about?")
+
+
+if __name__ == "__main__":
+    main()
