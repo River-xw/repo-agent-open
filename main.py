@@ -66,6 +66,23 @@ def display_book():
     import os
     import subprocess
 
+    # make sure nvm has been installed
+    # use "nvm --version" to check if nvm is installed
+    result = subprocess.run(
+        ["bash", "-c", "nvm --version"], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print("NVM is not installed. Installing...")
+        # install nvm
+        subprocess.run(
+            [
+                "bash",
+                "-c",
+                "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash",
+            ]
+        )
+        subprocess.run(["bash", "-c", "source ~/.nvm/nvm.sh && nvm install v10.24.1"])
+
     subprocess.run(["cp", "-r", wiki_root, display_root])
 
     os.chdir(display_root)
