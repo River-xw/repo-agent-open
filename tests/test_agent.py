@@ -1,5 +1,5 @@
 from config import CONFIG
-from .tools import (
+from agents.tools import (
     read_file_tool,
     write_file_tool,
     get_repo_structure_tool,
@@ -227,12 +227,12 @@ class RepoInfoAgent:
 
     def run(self, repo_path: str, owner: str = None, repo_name: str = None) -> dict:
         """Collect repository information.
-        
+
         Args:
             repo_path (str): Local path to the repository
             owner (str, optional): Repository owner (for remote info)
             repo_name (str, optional): Repository name (for remote info)
-            
+
         Returns:
             dict: Repository information in structured format
         """
@@ -274,7 +274,9 @@ class RepoInfoAgent:
             initial_state,
             stream_mode="values",
             config={
-                "configurable": {"thread_id": f"repo-info-{datetime.now().timestamp()}"},
+                "configurable": {
+                    "thread_id": f"repo-info-{datetime.now().timestamp()}"
+                },
                 "recursion_limit": 50,
             },
         ):
@@ -289,7 +291,8 @@ class RepoInfoAgent:
                     content = last_message.content
                     # Find JSON block in the content
                     import re
-                    json_match = re.search(r'\{[\s\S]*\}', content)
+
+                    json_match = re.search(r"\{[\s\S]*\}", content)
                     if json_match:
                         result = json.loads(json_match.group())
                         return result
@@ -301,7 +304,7 @@ class RepoInfoAgent:
                             "main_language": "Unknown",
                             "structure": [],
                             "commits": [],
-                            "raw_output": content
+                            "raw_output": content,
                         }
                 except json.JSONDecodeError as e:
                     print(f"Failed to parse JSON from agent output: {e}")
@@ -312,7 +315,7 @@ class RepoInfoAgent:
                         "structure": [],
                         "commits": [],
                         "error": str(e),
-                        "raw_output": last_message.content
+                        "raw_output": last_message.content,
                     }
 
         # Fallback if no result
@@ -321,8 +324,9 @@ class RepoInfoAgent:
             "description": "No information collected",
             "main_language": "Unknown",
             "structure": [],
-            "commits": []
+            "commits": [],
         }
+
 
 # ========== RepoInfoAgentTest ==========
 
@@ -346,6 +350,7 @@ class RepoInfoAgent:
 
 
 # ========== 2. CodeAnalysisAgent ==========
+
 
 class CodeAnalysisAgent:
     def __init__(self, llm, tools):
@@ -420,12 +425,12 @@ class CodeAnalysisAgent:
 
     def run(self, repo_path: str, file_list: list, batch_size: int = 5) -> dict:
         """Analyze core code files.
-        
+
         Args:
             repo_path (str): Local path to the repository
             file_list (list): List of file paths to analyze (relative to repo_path)
             batch_size (int): Number of files to analyze in one batch (default 5)
-            
+
         Returns:
             dict: Analysis results for all files
         """
@@ -438,12 +443,25 @@ class CodeAnalysisAgent:
                     "total_functions": 0,
                     "total_classes": 0,
                     "average_complexity": 0,
-                    "total_lines": 0
-                }
+                    "total_lines": 0,
+                },
             }
 
         # Filter valid code files (skip non-code files)
-        code_extensions = {'.py', '.js', '.java', '.cpp', '.c', '.go', '.rs', '.ts', '.jsx', '.tsx'}
+        code_extensions = {
+            ".py",
+            ".js",
+            ".java",
+            ".cpp",
+            ".c",
+            ".go",
+            ".rs",
+            ".ts",
+            ".jsx",
+            ".tsx",
+            ".h",
+            ".hpp",
+        }
         valid_files = []
         for f in file_list:
             # 如果是相对路径，拼接 repo_path
@@ -451,13 +469,13 @@ class CodeAnalysisAgent:
                 full_path = os.path.join(repo_path, f)
             else:
                 full_path = f
-            
+
             if os.path.exists(full_path):
                 if any(full_path.endswith(ext) for ext in code_extensions):
                     valid_files.append(full_path)
             else:
                 print(f"Warning: File {full_path} does not exist, skipping...")
-        
+
         if not valid_files:
             return {
                 "total_files": len(file_list),
@@ -467,23 +485,25 @@ class CodeAnalysisAgent:
                     "total_functions": 0,
                     "total_classes": 0,
                     "average_complexity": 0,
-                    "total_lines": 0
+                    "total_lines": 0,
                 },
-                "warning": "No valid code files found to analyze"
+                "warning": "No valid code files found to analyze",
             }
 
         # Limit to first N files to avoid context overflow
         max_files = 20
         if len(valid_files) > max_files:
             valid_files = valid_files[:max_files]
-            print(f"Warning: Analyzing only first {max_files} files to avoid context overflow")
+            print(
+                f"Warning: Analyzing only first {max_files} files to avoid context overflow"
+            )
 
         # Process files in batches
         all_results = {}
-        
+
         for i in range(0, len(valid_files), batch_size):
-            batch = valid_files[i:i + batch_size]
-            
+            batch = valid_files[i : i + batch_size]
+
             prompt = f"""
                         Analyze the following code files:
 
@@ -528,14 +548,16 @@ class CodeAnalysisAgent:
                 initial_state,
                 stream_mode="values",
                 config={
-                    "configurable": {"thread_id": f"code-analysis-{datetime.now().timestamp()}"},
+                    "configurable": {
+                        "thread_id": f"code-analysis-{datetime.now().timestamp()}"
+                    },
                     "recursion_limit": 100,  # Allow more recursion for multiple file analysis
                 },
             ):
                 final_state = state
                 # Optional: print progress
                 last_msg = state["messages"][-1]
-                if hasattr(last_msg, 'tool_calls') and last_msg.tool_calls:
+                if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
                     print(f"  Analyzing files in batch {i//batch_size + 1}...")
 
             # Extract results from final state
@@ -545,7 +567,8 @@ class CodeAnalysisAgent:
                     try:
                         content = last_message.content
                         import re
-                        json_match = re.search(r'\{[\s\S]*\}', content)
+
+                        json_match = re.search(r"\{[\s\S]*\}", content)
                         if json_match:
                             batch_results = json.loads(json_match.group())
                             if "files" in batch_results:
@@ -559,7 +582,7 @@ class CodeAnalysisAgent:
                         for file_path in batch:
                             all_results[file_path] = {
                                 "error": "JSON parse error",
-                                "raw_output": last_message.content[:500]
+                                "raw_output": last_message.content[:500],
                             }
 
         # Calculate summary statistics
@@ -588,12 +611,14 @@ class CodeAnalysisAgent:
                 "total_classes": total_classes,
                 "average_complexity": round(avg_complexity, 2),
                 "total_lines": total_lines,
-                "languages": list(set(
-                    analysis.get("language", "unknown") 
-                    for analysis in all_results.values() 
-                    if "error" not in analysis
-                ))
-            }
+                "languages": list(
+                    set(
+                        analysis.get("language", "unknown")
+                        for analysis in all_results.values()
+                        if "error" not in analysis
+                    )
+                ),
+            },
         }
 
 
@@ -607,18 +632,14 @@ import os
 
 file_list = []
 for root, dirs, files in os.walk(repo_path):
-    dirs[:] = [d for d in dirs if d not in ['.git', 'node_modules', '__pycache__']]
+    dirs[:] = [d for d in dirs if d not in [".git", "node_modules", "__pycache__"]]
     for file in files:
-        if file.endswith(('.c', '.h')) and len(file_list) < 4:
+        if file.endswith((".c", ".h")) and len(file_list) < 4:
             file_list.append(os.path.join(root, file))
 
 print(f"Found files: {file_list}")
 
-code_analysis = code_agent.run(
-    repo_path=repo_path,
-    file_list=file_list,
-    batch_size=4
-)
+code_analysis = code_agent.run(repo_path=repo_path, file_list=file_list, batch_size=4)
 
 print(json.dumps(code_analysis, indent=2))
 
