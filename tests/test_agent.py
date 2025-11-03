@@ -352,279 +352,6 @@ def RepoInfoAgentTest():
 
 # ========== 2. CodeAnalysisAgent ==========
 
-
-class CodeAnalysisAgent:
-    def __init__(self, llm, tools):
-        self.llm = llm.bind_tools(tools, parallel_tool_calls=False)
-        self.tools = tools
-        self.tool_executor = ToolNode(tools)
-        self.memory = InMemorySaver()
-        self.app = self._build_app()
-
-    def _build_app(self):
-        """Build the agent workflow graph."""
-        workflow = StateGraph(AgentState)
-        workflow.add_node("agent", self._agent_node)
-        workflow.add_node("tools", self.tool_executor)
-        workflow.set_entry_point("agent")
-        workflow.add_conditional_edges(
-            "agent",
-            self._should_continue,
-            {
-                "continue": "tools",
-                "end": END,
-            },
-        )
-        workflow.add_edge("tools", "agent")
-        return workflow.compile(checkpointer=self.memory)
-
-    def _should_continue(self, state: AgentState) -> str:
-        """Determine whether to continue or end."""
-        messages = state["messages"]
-        last_message = messages[-1]
-        if not hasattr(last_message, "tool_calls") or not last_message.tool_calls:
-            return "end"
-        else:
-            return "continue"
-
-    def _agent_node(self, state: AgentState) -> AgentState:
-        """Call LLM with current state."""
-        system_prompt = SystemMessage(
-            content="""You are a code analysis expert. Your task is to analyze code files efficiently.
-
-                        IMPORTANT RULES:
-                        1. Call code_file_analysis_tool ONLY ONCE per file
-                        2. After analyzing all files, return results immediately in JSON format
-                        3. Do NOT repeat tool calls if you already have the results
-
-                        For each file, extract:
-                        - Main functions/classes with signatures
-                        - Dependencies and imports
-                        - Complexity score (1-10)
-                        - Lines of code
-
-                        Return results in this exact JSON structure:
-                        {
-                            "files": {
-                                "file_path": {
-                                    "language": "string",
-                                    "functions": [{"name": "...", "signature": "...", "line_start": 0, "line_end": 0}],
-                                    "classes": [{"name": "...", "methods": [], "line_start": 0, "line_end": 0}],
-                                    "imports": [],
-                                    "complexity_score": 5,
-                                    "lines_of_code": 100,
-                                    "summary": "Brief description"
-                                }
-                            }
-                        }
-
-                        Do NOT include any text outside the JSON structure.
-                    """
-        )
-        response = self.llm.invoke([system_prompt] + state["messages"])
-        return {"messages": [response]}
-
-    def run(self, repo_path: str, file_list: list, batch_size: int = 5) -> dict:
-        """Analyze core code files.
-
-        Args:
-            repo_path (str): Local path to the repository
-            file_list (list): List of file paths to analyze (relative to repo_path)
-            batch_size (int): Number of files to analyze in one batch (default 5)
-
-        Returns:
-            dict: Analysis results for all files
-        """
-        if not file_list:
-            return {
-                "total_files": 0,
-                "analyzed_files": 0,
-                "files": {},
-                "summary": {
-                    "total_functions": 0,
-                    "total_classes": 0,
-                    "average_complexity": 0,
-                    "total_lines": 0,
-                },
-            }
-
-        # Filter valid code files (skip non-code files)
-        code_extensions = {
-            ".py",
-            ".js",
-            ".java",
-            ".cpp",
-            ".c",
-            ".go",
-            ".rs",
-            ".ts",
-            ".jsx",
-            ".tsx",
-            ".h",
-            ".hpp",
-        }
-        valid_files = []
-        for f in file_list:
-            # 如果是相对路径，拼接 repo_path
-            if not os.path.isabs(f):
-                full_path = os.path.join(repo_path, f)
-            else:
-                full_path = f
-
-            if os.path.exists(full_path):
-                if any(full_path.endswith(ext) for ext in code_extensions):
-                    valid_files.append(full_path)
-            else:
-                print(f"Warning: File {full_path} does not exist, skipping...")
-
-        if not valid_files:
-            return {
-                "total_files": len(file_list),
-                "analyzed_files": 0,
-                "files": {},
-                "summary": {
-                    "total_functions": 0,
-                    "total_classes": 0,
-                    "average_complexity": 0,
-                    "total_lines": 0,
-                },
-                "warning": "No valid code files found to analyze",
-            }
-
-        # Limit to first N files to avoid context overflow
-        max_files = 1000
-        if len(valid_files) > max_files:
-            valid_files = valid_files[:max_files]
-            print(
-                f"Warning: Analyzing only first {max_files} files to avoid context overflow"
-            )
-
-        # Process files in batches
-        all_results = {}
-
-        for i in range(0, len(valid_files), batch_size):
-            batch = valid_files[i : i + batch_size]
-
-            prompt = f"""
-                        Analyze the following code files:
-
-                        Files to analyze (absolute paths):
-                        {json.dumps(batch, indent=2)}
-
-                        For each file:
-                        1. Use code_file_analysis_tool with the file path AS IS (already absolute)
-                        2. Extract the analysis information as specified in the system prompt
-                        3. Calculate a complexity score based on the analysis results
-
-                        After analyzing all files, provide results in this exact JSON format:
-                        {{
-                            "files": {{
-                                "file_path_1": {{
-                                    "language": "...",
-                                    "functions": [...],
-                                    "classes": [...],
-                                    "complexity_score": 5,
-                                    "lines_of_code": 100,
-                                    "summary": "..."
-                                }},
-                                "file_path_2": {{...}}
-                            }}
-                        }}
-
-                        Important: 
-                        - Call code_file_analysis_tool for EACH file separately
-                        - Return results in the exact JSON format above
-                        - Do NOT add extra text outside the JSON structure
-                    """
-
-            initial_state = AgentState(
-                messages=[HumanMessage(content=prompt)],
-                repo_path=repo_path,
-                wiki_path="",
-            )
-
-            # Run the agent workflow
-            final_state = None
-            for state in self.app.stream(
-                initial_state,
-                stream_mode="values",
-                config={
-                    "configurable": {
-                        "thread_id": f"code-analysis-{datetime.now().timestamp()}"
-                    },
-                    "recursion_limit": 100,  # Allow more recursion for multiple file analysis
-                },
-            ):
-                final_state = state
-                # Optional: print progress
-                last_msg = state["messages"][-1]
-                if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-                    print(f"  Analyzing files in batch {i//batch_size + 1}...")
-
-            # Extract results from final state
-            if final_state:
-                last_message = final_state["messages"][-1]
-                if hasattr(last_message, "content"):
-                    try:
-                        content = last_message.content
-                        import re
-
-                        json_match = re.search(r"\{[\s\S]*\}", content)
-                        if json_match:
-                            batch_results = json.loads(json_match.group())
-                            if "files" in batch_results:
-                                all_results.update(batch_results["files"])
-                            else:
-                                # If direct file results
-                                all_results.update(batch_results)
-                    except json.JSONDecodeError as e:
-                        print(f"Failed to parse JSON from batch analysis: {e}")
-                        # Store raw output for debugging
-                        for file_path in batch:
-                            all_results[file_path] = {
-                                "error": "JSON parse error",
-                                "raw_output": last_message.content[:500],
-                            }
-
-        # Calculate summary statistics
-        total_functions = 0
-        total_classes = 0
-        total_complexity = 0
-        total_lines = 0
-        analyzed_count = 0
-
-        for file_path, analysis in all_results.items():
-            if "error" not in analysis:
-                analyzed_count += 1
-                total_functions += len(analysis.get("functions", []))
-                total_classes += len(analysis.get("classes", []))
-                total_complexity += analysis.get("complexity_score", 0)
-                total_lines += analysis.get("lines_of_code", 0)
-
-        avg_complexity = total_complexity / analyzed_count if analyzed_count > 0 else 0
-
-        return {
-            "total_files": len(file_list),
-            "analyzed_files": analyzed_count,
-            "files": all_results,
-            "summary": {
-                "total_functions": total_functions,
-                "total_classes": total_classes,
-                "average_complexity": round(avg_complexity, 2),
-                "total_lines": total_lines,
-                "languages": list(
-                    set(
-                        analysis.get("language", "unknown")
-                        for analysis in all_results.values()
-                        if "error" not in analysis
-                    )
-                ),
-            },
-        }
-
-
-# ========== 2. CodeAnalysisAgent ==========
-
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple
 import copy
@@ -849,25 +576,25 @@ class CodeAnalysisAgent:
         
         # Create a single-file prompt
         prompt = f"""
-Analyze this code file:
+                    Analyze this code file:
 
-File path: {file_path}
+                    File path: {file_path}
 
-Use code_file_analysis_tool to analyze the file, then provide the analysis in this exact JSON format:
-{{
-    "language": "...",
-    "functions": [...],
-    "classes": [...],
-    "complexity_score": 5,
-    "lines_of_code": 100,
-    "summary": "..."
-}}
+                    Use code_file_analysis_tool to analyze the file, then provide the analysis in this exact JSON format:
+                    {{
+                        "language": "...",
+                        "functions": [...],
+                        "classes": [...],
+                        "complexity_score": 5,
+                        "lines_of_code": 100,
+                        "summary": "..."
+                    }}
 
-Important:
-- Call code_file_analysis_tool with the file path AS IS
-- Return ONLY the JSON structure above
-- Do NOT add extra text outside the JSON
-"""
+                    Important:
+                    - Call code_file_analysis_tool with the file path AS IS
+                    - Return ONLY the JSON structure above
+                    - Do NOT add extra text outside the JSON
+                """
         
         initial_state = AgentState(
             messages=[HumanMessage(content=prompt)],
@@ -944,18 +671,18 @@ Important:
         self, 
         repo_path: str, 
         file_list: list, 
-        batch_size: int = 5,
+        batch_size: int = 1,
         parallel_batches: bool = True,
-        max_workers: int = 3
+        max_workers: int = 100
     ) -> dict:
         """Analyze core code files with parallel batch processing.
 
         Args:
             repo_path (str): Local path to the repository
             file_list (list): List of file paths to analyze
-            batch_size (int): Number of files to analyze in one batch (default 5)
+            batch_size (int): Number of files to analyze in one batch (default 1)
             parallel_batches (bool): Whether to process batches in parallel (default True)
-            max_workers (int): Maximum number of parallel batch workers (default 3)
+            max_workers (int): Maximum number of parallel batch workers (default 100)
 
         Returns:
             dict: Analysis results for all files
@@ -1011,11 +738,44 @@ Important:
             valid_files = valid_files[:max_files]
             print(f"Warning: Analyzing only first {max_files} files to avoid overflow")
 
-        # Split into batches
-        batches = [
-            valid_files[i : i + batch_size]
-            for i in range(0, len(valid_files), batch_size)
-        ]
+        # Sort files by size (largest first) for better load balancing
+        print("\nSorting files by size...")
+        file_sizes = []
+        for f in valid_files:
+            try:
+                size = os.path.getsize(f)
+                file_sizes.append((f, size))
+            except OSError:
+                file_sizes.append((f, 0))
+        
+        # Sort by size in descending order
+        file_sizes.sort(key=lambda x: x[1], reverse=True)
+        sorted_files = [f for f, _ in file_sizes]
+        
+        total_size = sum(size for _, size in file_sizes)
+        print(f"Total size: {total_size / 1024:.2f} KB")
+        print(f"Average file size: {total_size / len(file_sizes) / 1024:.2f} KB")
+        print(f"Largest file: {file_sizes[0][1] / 1024:.2f} KB")
+        print(f"Smallest file: {file_sizes[-1][1] / 1024:.2f} KB")
+
+        # Split into batches using greedy algorithm for balanced batch sizes
+        num_batches = (len(sorted_files) + batch_size - 1) // batch_size
+        batches = [[] for _ in range(num_batches)]
+        batch_sizes = [0] * num_batches
+        
+        # Greedy assignment: assign each file to the batch with smallest current size
+        for file_path, file_size in file_sizes:
+            # Find batch with minimum total size
+            min_batch_idx = batch_sizes.index(min(batch_sizes))
+            batches[min_batch_idx].append(file_path)
+            batch_sizes[min_batch_idx] += file_size
+        
+        # Remove empty batches
+        batches = [b for b in batches if b]
+        
+        print(f"\nCreated {len(batches)} balanced batches:")
+        for i, (batch, size) in enumerate(zip(batches, batch_sizes[:len(batches)]), 1):
+            print(f"  Batch {i}: {len(batch)} files, {size / 1024:.2f} KB")
 
         all_results = {}
 
@@ -1123,9 +883,9 @@ def CodeAnalysisAgentTest():
     code_analysis = code_agent.run(
         repo_path=repo_path,
         file_list=file_list,
-        batch_size=5,          
+        batch_size=1,          
         parallel_batches=True,  
-        max_workers=20          # 最大并行批次数
+        max_workers=100          # 最大并行批次数
     )
 
     print("\n" + "="*60)
