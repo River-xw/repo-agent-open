@@ -783,7 +783,7 @@ class CodeAnalysisAgent:
             # ========== 批次间并行处理 ==========
             print(f"\n Processing {len(batches)} batches in PARALLEL (max {max_workers} concurrent batches)...")
             
-            start_time = datetime.now()
+            # start_time = datetime.now()
             
             with ThreadPoolExecutor(max_workers=min(len(batches), max_workers)) as executor:
                 # 为每个批次提交一个独立的 agent 任务
@@ -837,9 +837,9 @@ class CodeAnalysisAgent:
 
         avg_complexity = total_complexity / analyzed_count if analyzed_count > 0 else 0
         
-        end_time = datetime.now()
+        # end_time = datetime.now()
         
-        print(f"\n Total analysis time: {end_time - start_time}\n")
+        # print(f"\n Total analysis time: {end_time - start_time}\n")
 
         return {
             "total_files": len(file_list),
@@ -898,7 +898,7 @@ def CodeAnalysisAgentTest():
     print("="*60)
 
 
-CodeAnalysisAgentTest()
+# CodeAnalysisAgentTest()
 # ========== CodeAnalysisAgentTest ==========
 
 
@@ -1497,7 +1497,7 @@ class WikiSupervisor:
         self.doc_result = None
         self.summary_result = None
 
-    def generate(self, max_files: int = 10) -> Dict[str, Any]:
+    def generate(self, max_files: int = 50) -> Dict[str, Any]:
         """Execute the complete wiki generation pipeline.
         
         Args:
@@ -1509,12 +1509,14 @@ class WikiSupervisor:
         print("\n" + "="*60)
         print("WIKI GENERATION PIPELINE STARTED")
         print("="*60)
+        all_start_time = datetime.now()
         
         try:
             # Stage 1: Collect repository information
             print("\n" + "="*60)
             print("Stage 1: Collecting Repository Information")
             print("="*60)
+            start_time = datetime.now()
             self.repo_info = self.repo_agent.run(
                 repo_path=self.repo_path,
                 owner=self.owner,
@@ -1523,11 +1525,14 @@ class WikiSupervisor:
             print(f"✓ Repository: {self.repo_info.get('repo_name', 'Unknown')}")
             print(f"✓ Language: {self.repo_info.get('main_language', 'Unknown')}")
             print(f"✓ Directories: {len(self.repo_info.get('structure', []))}")
+            print(f"✓ Commits: {len(self.repo_info.get('commits', []))}")
+            print(f"✓ Stage 1 Time taken: {datetime.now() - start_time}")
             
             # Stage 2: Analyze code files
             print("\n" + "="*60)
             print("Stage 2: Analyzing Code Files")
             print("="*60)
+            start_time = datetime.now()
             
             # Intelligently select files to analyze
             file_list = self._select_important_files(self.repo_info, max_files)
@@ -1556,16 +1561,21 @@ class WikiSupervisor:
                 self.code_analysis = self.code_agent.run(
                     repo_path=self.repo_path,
                     file_list=file_list,
-                    batch_size=min(5, len(file_list))
+                    batch_size=min(5, len(file_list)),
+                    parallel_batches=True,
+                    max_workers=10
                 )
                 print(f"✓ Analyzed {self.code_analysis.get('analyzed_files', 0)} files")
                 print(f"✓ Total functions: {self.code_analysis['summary'].get('total_functions', 0)}")
                 print(f"✓ Total classes: {self.code_analysis['summary'].get('total_classes', 0)}")
+                print(f"✓ Average complexity: {self.code_analysis['summary'].get('average_complexity', 0)}")
+                print(f"✓ Stage 2 Time taken: {datetime.now() - start_time}")
             
             # Stage 3: Generate documentation
             print("\n" + "="*60)
             print("Stage 3: Generating Documentation")
             print("="*60)
+            start_time = datetime.now()
             
             self.doc_result = self.doc_agent.run(
                 repo_info=self.repo_info,
@@ -1574,11 +1584,13 @@ class WikiSupervisor:
             )
             generated_docs = self.doc_result.get("generated_files", [])
             print(f"✓ Generated {len(generated_docs)} documents")
+            print(f"✓ Stage 3 Time taken: {datetime.now() - start_time}")
             
             # Stage 4: Generate index
             print("\n" + "="*60)
             print("Stage 4: Generating Index")
             print("="*60)
+            start_time = datetime.now()
             
             self.summary_result = self.summary_agent.run(
                 docs=generated_docs,
@@ -1587,10 +1599,12 @@ class WikiSupervisor:
                 code_analysis=self.code_analysis
             )
             print(f"✓ Index file: {self.summary_result.get('index_file', 'N/A')}")
+            print(f"✓ Stage 4 Time taken: {datetime.now() - start_time}")
             
             # Final summary
             print("\n" + "="*60)
             print("WIKI GENERATION PIPELINE COMPLETED")
+            print(f"Total Time taken: {datetime.now() - all_start_time}")
             print("="*60)
             
             pipeline_summary = self._generate_pipeline_summary()
@@ -1618,43 +1632,126 @@ class WikiSupervisor:
         Returns:
             list: List of file paths to analyze
         """
-        code_extensions = {'.py', '.js', '.java', '.cpp', '.c', '.go', '.rs', '.ts', '.jsx', '.tsx', '.h', '.hpp'}
+        code_extensions = {'.py', '.js', '.java', '.cpp', '.c', '.go', '.rs', '.ts', '.jsx', '.tsx', '.h', '.hpp', '.cs', '.rb', '.php'}
         
         file_list = []
         structure = repo_info.get('structure', [])
         
         # Priority directories (analyze these first)
-        priority_dirs = ['src', 'lib', 'core', 'app', 'main', 'api']
+        priority_dirs = ['src', 'lib', 'core', 'app', 'main', 'api', 'pkg', 'internal']
         
-        # Search in priority directories first
+        print(f"\nSearching for code files (max: {max_files})...")
+        print(f"Repository structure: {structure}")
+        
+        # Phase 1: Search in priority directories
+        print("\nPhase 1: Searching priority directories...")
         for priority_dir in priority_dirs:
             if len(file_list) >= max_files:
                 break
+                
             for root_dir in structure:
-                if priority_dir in root_dir.lower():
+                if len(file_list) >= max_files:
+                    break
+                    
+                # Match priority directory in structure
+                # Use case-insensitive matching and check if priority_dir is in the path
+                if priority_dir.lower() in root_dir.lower():
                     dir_path = os.path.join(self.repo_path, root_dir)
                     if os.path.isdir(dir_path):
-                        for root, dirs, files in os.walk(dir_path):
-                            # Skip common build/cache directories
-                            dirs[:] = [d for d in dirs if d not in ['.git', 'node_modules', '__pycache__', 'build', 'dist', 'target']]
-                            for file in files:
-                                if len(file_list) >= max_files:
-                                    break
-                                if any(file.endswith(ext) for ext in code_extensions):
-                                    file_list.append(os.path.join(root, file))
+                        print(f"  Scanning priority directory: {root_dir}")
+                        collected = self._collect_code_files_from_dir(
+                            dir_path, 
+                            code_extensions, 
+                            max_files - len(file_list)
+                        )
+                        file_list.extend(collected)
+                        print(f"    Found {len(collected)} files, total: {len(file_list)}")
         
-        # If still need more files, search all directories
+        # Phase 2: Search remaining directories if needed
         if len(file_list) < max_files:
-            for root, dirs, files in os.walk(self.repo_path):
-                dirs[:] = [d for d in dirs if d not in ['.git', 'node_modules', '__pycache__', 'build', 'dist', 'target']]
-                for file in files:
-                    if len(file_list) >= max_files:
-                        break
-                    file_path = os.path.join(root, file)
-                    if file_path not in file_list and any(file.endswith(ext) for ext in code_extensions):
-                        file_list.append(file_path)
+            print(f"\nPhase 2: Searching remaining directories (need {max_files - len(file_list)} more files)...")
+            for root_dir in structure:
+                if len(file_list) >= max_files:
+                    break
+                    
+                # Skip if already searched
+                if any(priority_dir.lower() in root_dir.lower() for priority_dir in priority_dirs):
+                    continue
+                    
+                dir_path = os.path.join(self.repo_path, root_dir)
+                if os.path.isdir(dir_path):
+                    print(f"  Scanning directory: {root_dir}")
+                    collected = self._collect_code_files_from_dir(
+                        dir_path, 
+                        code_extensions, 
+                        max_files - len(file_list)
+                    )
+                    if collected:
+                        file_list.extend(collected)
+                        print(f"    Found {len(collected)} files, total: {len(file_list)}")
         
+        # Phase 3: If still insufficient, do a full repository scan
+        if len(file_list) < max_files:
+            print(f"\nPhase 3: Full repository scan (need {max_files - len(file_list)} more files)...")
+            remaining = self._collect_code_files_from_dir(
+                self.repo_path,
+                code_extensions,
+                max_files - len(file_list),
+                exclude_existing=file_list
+            )
+            file_list.extend(remaining)
+            print(f"  Found {len(remaining)} additional files, total: {len(file_list)}")
+        
+        print(f"\n✓ Selected {len(file_list)} files for analysis")
         return file_list[:max_files]
+
+    def _collect_code_files_from_dir(
+        self, 
+        dir_path: str, 
+        extensions: set, 
+        max_count: int,
+        exclude_existing: list = None
+    ) -> list:
+        """Collect code files from a directory.
+        
+        Args:
+            dir_path (str): Directory path to search
+            extensions (set): Set of file extensions to include
+            max_count (int): Maximum number of files to collect
+            exclude_existing (list): List of files to exclude
+            
+        Returns:
+            list: List of file paths
+        """
+        if exclude_existing is None:
+            exclude_existing = []
+        
+        collected = []
+        exclude_dirs = {'.git', 'node_modules', '__pycache__', 'build', 'dist', 'target', 
+                        'venv', 'env', '.venv', '.env', 'vendor', 'third_party',
+                        '.pytest_cache', '.mypy_cache', '.tox', 'htmlcov'}
+        
+        try:
+            for root, dirs, files in os.walk(dir_path):
+                # Filter out excluded directories
+                dirs[:] = [d for d in dirs if d not in exclude_dirs]
+                
+                for file in files:
+                    if len(collected) >= max_count:
+                        return collected
+                    
+                    # Check file extension
+                    if any(file.endswith(ext) for ext in extensions):
+                        file_path = os.path.join(root, file)
+                        
+                        # Skip if already in exclude list
+                        if file_path not in exclude_existing and file_path not in collected:
+                            collected.append(file_path)
+        
+        except Exception as e:
+            print(f"  Warning: Error scanning {dir_path}: {e}")
+        
+        return collected
 
     def _get_current_stage(self) -> str:
         """Get the current stage of pipeline execution."""
@@ -1730,10 +1827,10 @@ def WikiSupervisorTest():
         repo_name="zstd"
     )
     
-    result = supervisor.generate(max_files=5)
+    result = supervisor.generate(max_files=20)
     
     print("\n" + "="*60)
     print("Final Result:")
     print(json.dumps(result, indent=2))
 
-# WikiSupervisorTest()
+WikiSupervisorTest()
