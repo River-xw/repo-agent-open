@@ -10,6 +10,7 @@ from datetime import datetime
 import json
 import os
 import re
+import time
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple
@@ -30,34 +31,42 @@ class CodeAnalysisAgent(BaseAgent):
             wiki_path (str): Path to wiki (optional)
         """
         system_prompt = SystemMessage(
-            content="""You are a code analysis expert. Your task is to analyze code files efficiently.
+            content="""You are a code analysis expert. Your task is to analyze multiple code files efficiently in batch.
 
                         IMPORTANT RULES:
-                        1. Call code_file_analysis_tool ONLY ONCE per file
-                        2. After analyzing the file, return results immediately in JSON format
-                        3. Do NOT repeat tool calls if you already have the results
+                        1. For each file, call code_file_analysis_tool EXACTLY ONCE
+                        2. Analyze all files in the batch sequentially
+                        3. Return results for ALL files in a single JSON response
 
-                        For the file, extract:
+                        For each file, extract:
                         - Main functions/classes with signatures
-                        - Dependencies and imports
+                        - Dependencies and imports  
                         - Complexity score (1-10)
                         - Lines of code
 
                         Return results in this exact JSON structure:
                         {
-                            "language": "string",
-                            "functions": [{"name": "...", "signature": "...", "line_start": 0, "line_end": 0}],
-                            "classes": [{"name": "...", "methods": [], "line_start": 0, "line_end": 0}],
-                            "imports": [],
-                            "complexity_score": 5,
-                            "lines_of_code": 100,
-                            "summary": "Brief description"
+                            "results": {
+                                "/path/to/file1.c": {
+                                    "language": "C",
+                                    "functions": [...],
+                                    "classes": [...],
+                                    "imports": [],
+                                    "complexity_score": 5,
+                                    "lines_of_code": 100,
+                                    "summary": "Brief description"
+                                },
+                                "/path/to/file2.h": {
+                                    ...
+                                }
+                            }
                         }
 
                         CRITICAL:
                         - Return ONLY the JSON object, no additional text
-                        - Do NOT wrap in markdown code blocks
-                        - Ensure all fields are present
+                        - Include ALL files from the batch in the results
+                        - Use absolute file paths as keys
+                        - If a file analysis fails, include an error field for that file
                     """
         )
         
@@ -73,155 +82,12 @@ class CodeAnalysisAgent(BaseAgent):
             wiki_path=wiki_path
         )
 
-    def _analyze_single_file(
-        self, 
-        file_path: str, 
-        batch_num: int, 
-        file_num: int
-    ) -> Tuple[str, dict]:
-        """Analyze a single file using a fresh agent instance.
-        
-        Each file gets its own agent to avoid context accumulation and token overflow.
-        
-        Args:
-            file_path (str): Path to the file to analyze
-            batch_num (int): Batch number for logging
-            file_num (int): File number within batch
-            
-        Returns:
-            Tuple[str, dict]: (file_path, analysis_result)
-        """
-        # Create fresh agent for this file (avoids context accumulation)
-        file_agent = CodeAnalysisAgent(repo_path=self.repo_path, wiki_path=self.wiki_path)
-        
-        # Prepare prompt for single file
-        prompt = f"""
-                    Analyze this code file:
-
-                    File path: {file_path}
-
-                    Tasks:
-                    1. Use code_file_analysis_tool with the file path AS IS
-                    2. Extract all required information
-                    3. Calculate complexity score based on:
-                    - Number of functions/classes
-                    - Code length
-                    - Nesting depth
-                    - Dependencies
-
-                    Return the analysis in the exact JSON format specified in the system prompt.
-
-                    IMPORTANT: Return ONLY the JSON, no extra text.
-                """
-
-        initial_state = AgentState(
-            messages=[HumanMessage(content=prompt)],
-            repo_path=self.repo_path,
-            wiki_path=self.wiki_path,
-        )
-
-        # Run analysis
-        final_state = None
-        try:
-            for state in file_agent.app.stream(
-                initial_state,
-                stream_mode="values",
-                config={
-                    "configurable": {
-                        "thread_id": f"file-{batch_num}-{file_num}-{datetime.now().timestamp()}"
-                    },
-                    "recursion_limit": 50,
-                },
-            ):
-                final_state = state
-
-            # Extract result
-            if final_state:
-                result = self._extract_file_result(final_state)
-                if "error" not in result:
-                    print(f"    [Batch {batch_num}] ✓ {os.path.basename(file_path)}")
-                else:
-                    print(f"    [Batch {batch_num}] ⚠ {os.path.basename(file_path)}: {result['error']}")
-                return file_path, result
-            else:
-                print(f"    [Batch {batch_num}] ✗ {os.path.basename(file_path)}: No result")
-                return file_path, {"error": "No result from agent"}
-
-        except Exception as e:
-            print(f"    [Batch {batch_num}] ✗ {os.path.basename(file_path)}: {e}")
-            return file_path, {"error": str(e)}
-
-    def _extract_file_result(self, final_state: AgentState) -> dict:
-        """Extract analysis result from final state.
-        
-        Args:
-            final_state (AgentState): The final agent state
-            
-        Returns:
-            dict: Parsed analysis result or error
-        """
-        if not final_state:
-            return {"error": "No final state"}
-
-        last_message = final_state["messages"][-1]
-        
-        if not hasattr(last_message, "content"):
-            return {"error": "No content in message"}
-
-        try:
-            content = last_message.content
-            
-            # Try to extract JSON
-            # Method 1: Look for JSON code block
-            json_code_block = re.search(r'```json\s*([\s\S]*?)\s*```', content)
-            if json_code_block:
-                json_str = json_code_block.group(1)
-            else:
-                # Method 2: Look for plain JSON object
-                json_match = re.search(r'\{[\s\S]*\}', content)
-                if json_match:
-                    json_str = json_match.group()
-                else:
-                    return {
-                        "error": "No JSON found in response",
-                        "raw_output": content[:500]
-                    }
-            
-            # Clean JSON string
-            json_str = re.sub(r',(\s*[}\]])', r'\1', json_str)  # Remove trailing commas
-            
-            # Parse JSON
-            result = json.loads(json_str)
-            
-            # Validate required fields
-            required_fields = ["language", "functions", "classes", "complexity_score", "lines_of_code"]
-            missing_fields = [f for f in required_fields if f not in result]
-            
-            if missing_fields:
-                return {
-                    "error": f"Missing fields: {missing_fields}",
-                    "partial_data": result
-                }
-            
-            return result
-
-        except json.JSONDecodeError as e:
-            return {
-                "error": f"JSON parse error: {e}",
-                "raw_output": content[:500]
-            }
-        except Exception as e:
-            return {
-                "error": f"Unexpected error: {e}",
-                "raw_output": str(content)[:500] if content else ""
-            }
-
     def _analyze_batch(
         self, 
         batch: List[str], 
         batch_num: int
     ) -> Tuple[int, dict]:
-        """Analyze a batch of files sequentially.
+        """Analyze a batch of files in a SINGLE LLM call.
         
         Args:
             batch (List[str]): List of file paths
@@ -230,23 +96,175 @@ class CodeAnalysisAgent(BaseAgent):
         Returns:
             Tuple[int, dict]: (batch_num, batch_results)
         """
-        print(f"  [Batch {batch_num}] Starting analysis of {len(batch)} files...")
+        print(f"  [Batch {batch_num}] Analyzing {len(batch)} files in ONE LLM call...")
+        start_time = time.time()
         
-        batch_results = {}
+        # Build prompt for batch analysis
+        file_list_str = "\n".join([f"  - {f}" for f in batch])
         
-        for i, file_path in enumerate(batch, 1):
-            file_path_key, file_result = self._analyze_single_file(
-                file_path, batch_num, i
-            )
-            batch_results[file_path_key] = file_result
+        prompt = f"""
+                    Analyze the following {len(batch)} code files:
+
+                    {file_list_str}
+
+                    For each file:
+                    1. Use code_file_analysis_tool with the EXACT file path
+                    2. Extract all required information
+                    3. Calculate complexity score based on:
+                    - Number of functions/classes
+                    - Code length
+                    - Nesting depth
+                    - Dependencies
+
+                    Return results for ALL files in the JSON format specified in the system prompt.
+
+                    IMPORTANT: 
+                    - Analyze each file ONCE
+                    - Include ALL {len(batch)} files in your response
+                    - Use the absolute file paths as JSON keys
+                """
+
+        initial_state = AgentState(
+            messages=[HumanMessage(content=prompt)],
+            repo_path=self.repo_path,
+            wiki_path=self.wiki_path,
+        )
+
+        # Run batch analysis
+        final_state = None
+        try:
+            for state in self.app.stream(
+                initial_state,
+                stream_mode="values",
+                config={
+                    "configurable": {
+                        "thread_id": f"batch-{batch_num}-{datetime.now().timestamp()}"
+                    },
+                    "recursion_limit": 100,  # Increased for multiple files
+                },
+            ):
+                final_state = state
+                
+                # Log tool calls
+                last_msg = state["messages"][-1]
+                if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+                    for tool_call in last_msg.tool_calls:
+                        if tool_call['name'] == 'code_file_analysis_tool':
+                            file_path = tool_call.get('args', {}).get('file_path', 'unknown')
+                            file_name = os.path.basename(file_path)
+                            print(f"    [Batch {batch_num}] Analyzing: {file_name}")
+
+            # Extract results
+            if final_state:
+                batch_results = self._extract_batch_results(final_state, batch, batch_num)
+                
+                # Print summary
+                success_count = sum(1 for r in batch_results.values() if "error" not in r)
+                error_count = len(batch_results) - success_count
+                print(f"  [Batch {batch_num}] ✓ Completed in {time.time() - start_time:.2f}s: {success_count} success, {error_count} errors")
+                
+                return batch_num, batch_results
+            else:
+                print(f"  [Batch {batch_num}] ✗ No result from LLM")
+                return batch_num, {f: {"error": "No result from LLM"} for f in batch}
+
+        except Exception as e:
+            print(f"  [Batch {batch_num}] ✗ Batch failed: {e}")
+            return batch_num, {f: {"error": f"Batch failed: {e}"} for f in batch}
+
+    def _extract_batch_results(
+        self, 
+        final_state: AgentState, 
+        expected_files: List[str],
+        batch_num: int
+    ) -> dict:
+        """Extract results for all files in the batch.
         
-        print(f"  [Batch {batch_num}] ✓ Completed ({len(batch_results)} files)")
-        return batch_num, batch_results
+        Args:
+            final_state (AgentState): The final agent state
+            expected_files (List[str]): List of file paths we expected to analyze
+            batch_num (int): Batch number for logging
+            
+        Returns:
+            dict: Results for each file
+        """
+        if not final_state:
+            return {f: {"error": "No final state"} for f in expected_files}
+
+        last_message = final_state["messages"][-1]
+        
+        if not hasattr(last_message, "content"):
+            return {f: {"error": "No content in message"} for f in expected_files}
+
+        try:
+            content = last_message.content
+            
+            # Try to extract JSON
+            json_code_block = re.search(r'```json\s*([\s\S]*?)\s*```', content)
+            if json_code_block:
+                json_str = json_code_block.group(1)
+            else:
+                json_match = re.search(r'\{[\s\S]*\}', content)
+                if json_match:
+                    json_str = json_match.group()
+                else:
+                    print(f"  [Batch {batch_num}] ⚠ No JSON found in response")
+                    return {f: {"error": "No JSON in response"} for f in expected_files}
+            
+            # Clean and parse JSON
+            json_str = re.sub(r',(\s*[}\]])', r'\1', json_str)
+            result = json.loads(json_str)
+            
+            # Extract results for each file
+            batch_results = {}
+            
+            # Check if results are in a "results" key
+            if "results" in result:
+                file_results = result["results"]
+            else:
+                file_results = result
+            
+            # Match results to expected files
+            for file_path in expected_files:
+                # Try exact match first
+                if file_path in file_results:
+                    batch_results[file_path] = file_results[file_path]
+                    
+                    # Validate required fields
+                    required_fields = ["language", "functions", "classes", "complexity_score", "lines_of_code"]
+                    missing_fields = [f for f in required_fields if f not in batch_results[file_path]]
+                    
+                    if missing_fields:
+                        batch_results[file_path]["warning"] = f"Missing fields: {missing_fields}"
+                else:
+                    # Try to match by basename
+                    basename = os.path.basename(file_path)
+                    matched = False
+                    
+                    for result_key, result_value in file_results.items():
+                        if os.path.basename(result_key) == basename:
+                            batch_results[file_path] = result_value
+                            matched = True
+                            break
+                    
+                    if not matched:
+                        batch_results[file_path] = {
+                            "error": f"No result found for this file in LLM response"
+                        }
+            
+            return batch_results
+
+        except json.JSONDecodeError as e:
+            print(f"  [Batch {batch_num}] ✗ JSON parse error: {e}")
+            return {f: {"error": f"JSON parse error: {e}"} for f in expected_files}
+        except Exception as e:
+            print(f"  [Batch {batch_num}] ✗ Unexpected error: {e}")
+            return {f: {"error": f"Unexpected error: {e}"} for f in expected_files}
 
     def run(
         self,
         file_list: list,
-        batch_size: int = 2,
+        batch_size: int = 5,
         parallel_batches: bool = True,
         max_workers: int = 10,
         max_files: int = 500
@@ -255,13 +273,17 @@ class CodeAnalysisAgent(BaseAgent):
 
         Args:
             file_list (list): List of file paths to analyze
-            batch_size (int): Number of files per batch (default: 10)
+            batch_size (int): Number of files per batch (default: 5)
             parallel_batches (bool): Whether to process batches in parallel (default: True)
-            max_workers (int): Maximum number of parallel workers (default: 3)
+            max_workers (int): Maximum number of parallel workers (default: 10)
+            max_files (int): Maximum number of files to analyze (default: 500)
 
         Returns:
             dict: Analysis results including summary statistics
         """
+        
+        start_time = time.time()
+        
         if not file_list:
             return self._empty_result()
 
@@ -284,11 +306,15 @@ class CodeAnalysisAgent(BaseAgent):
         
         if parallel_batches and len(batches) > 1:
             print(f"\n Processing {len(batches)} batches in PARALLEL (max {max_workers} workers)...")
+            print(f"   Each batch processes {batch_size} files in ONE LLM call")
             all_results = self._process_batches_parallel(batches, max_workers)
         else:
             print(f"\n Processing {len(batches)} batches SEQUENTIALLY...")
+            print(f"   Each batch processes {batch_size} files in ONE LLM call")
             all_results = self._process_batches_sequential(batches)
 
+        print(f"\n✓ Completed analysis of {len(valid_files)} files in {time.time() - start_time:.2f}s")
+        
         # Calculate summary
         return self._build_result(file_list, all_results, parallel_batches, len(batches))
 
@@ -315,10 +341,7 @@ class CodeAnalysisAgent(BaseAgent):
         return valid_files
 
     def _create_balanced_batches(self, files: list, batch_size: int) -> list:
-        """Create balanced batches using greedy algorithm.
-        
-        Files are sorted by size (largest first) and assigned to batches
-        to minimize variance in batch sizes.
+        """Create balanced batches using round-robin distribution.
         
         Args:
             files (list): List of file paths
@@ -327,7 +350,7 @@ class CodeAnalysisAgent(BaseAgent):
         Returns:
             list: List of batches (each batch is a list of file paths)
         """
-        print("\nSorting files by size...")
+        print("\nCreating balanced batches...")
         
         # Get file sizes
         file_sizes = []
@@ -343,27 +366,30 @@ class CodeAnalysisAgent(BaseAgent):
         
         # Print statistics
         total_size = sum(size for _, size in file_sizes)
+        print(f"Total files: {len(files)}")
         print(f"Total size: {total_size / 1024:.2f} KB")
         print(f"Average file size: {total_size / len(file_sizes) / 1024:.2f} KB")
         print(f"Largest file: {file_sizes[0][1] / 1024:.2f} KB")
         print(f"Smallest file: {file_sizes[-1][1] / 1024:.2f} KB")
         
-        # Create batches using greedy algorithm
+        # Calculate number of batches
         num_batches = (len(files) + batch_size - 1) // batch_size
+        
         batches = [[] for _ in range(num_batches)]
         batch_sizes = [0] * num_batches
         
-        # Assign each file to the batch with smallest current size
-        for file_path, file_size in file_sizes:
-            min_batch_idx = batch_sizes.index(min(batch_sizes))
-            batches[min_batch_idx].append(file_path)
-            batch_sizes[min_batch_idx] += file_size
+        # Distribute files round-robin (largest files distributed first)
+        for idx, (file_path, file_size) in enumerate(file_sizes):
+            batch_idx = idx % num_batches
+            batches[batch_idx].append(file_path)
+            batch_sizes[batch_idx] += file_size
         
         # Remove empty batches
         batches = [b for b in batches if b]
+        batch_sizes = batch_sizes[:len(batches)]
         
-        print(f"\nCreated {len(batches)} balanced batches:")
-        for i, (batch, size) in enumerate(zip(batches, batch_sizes[:len(batches)]), 1):
+        print(f"\nCreated {len(batches)} batches (round-robin distribution):")
+        for i, (batch, size) in enumerate(zip(batches, batch_sizes), 1):
             print(f"  Batch {i}: {len(batch)} files, {size / 1024:.2f} KB")
         
         return batches
@@ -393,10 +419,9 @@ class CodeAnalysisAgent(BaseAgent):
                 try:
                     batch_num, batch_results = future.result()
                     all_results.update(batch_results)
-                    print(f"✓ Batch {batch_num} results merged")
+                    print(f"✓ Batch {batch_num} results merged into final results")
                 except Exception as e:
                     print(f"✗ Batch {batch_idx + 1} failed: {e}")
-                    # Add error for all files in failed batch
                     for file_path in batches[batch_idx]:
                         all_results[file_path] = {"error": f"Batch failed: {e}"}
         
@@ -470,7 +495,8 @@ class CodeAnalysisAgent(BaseAgent):
             "processing": {
                 "mode": "parallel" if parallel and num_batches > 1 else "sequential",
                 "num_batches": num_batches,
-                "batch_size": len(original_files) // num_batches if num_batches > 0 else 0,
+                "files_per_batch": len(original_files) // num_batches if num_batches > 0 else 0,
+                "llm_calls": num_batches,
             }
         }
 
@@ -497,7 +523,8 @@ class CodeAnalysisAgent(BaseAgent):
             "processing": {
                 "mode": "none",
                 "num_batches": 0,
-                "batch_size": 0,
+                "files_per_batch": 0,
+                "llm_calls": 0,
             }
         }
         
@@ -509,13 +536,16 @@ class CodeAnalysisAgent(BaseAgent):
 
 # ========== CodeAnalysisAgentTest ==========
 def CodeAnalysisAgentTest():
+    """Test the CodeAnalysisAgent."""
+    print("="*80)
+    print("Testing CodeAnalysisAgent with Batch LLM Calls")
+    print("="*80)
     
     repo_path = "./.repos/facebook_zstd"
     
     # Collect test files
     file_list = []
     for root, dirs, files in os.walk(repo_path):
-        # Skip common directories
         dirs[:] = [d for d in dirs if d not in ['.git', 'node_modules', '__pycache__', 'build', 'dist']]
         
         for file in files:
@@ -523,7 +553,6 @@ def CodeAnalysisAgentTest():
                 file_path = os.path.join(root, file)
                 file_list.append(file_path)
                 
-                # Limit for testing
                 if len(file_list) >= 20:
                     break
         
@@ -542,9 +571,9 @@ def CodeAnalysisAgentTest():
     
     results = agent.run(
         file_list=file_list,
-        batch_size=5,
+        batch_size=2,
         parallel_batches=True,
-        max_workers=3
+        max_workers=10
     )
     
     # Print results
@@ -554,28 +583,13 @@ def CodeAnalysisAgentTest():
     print(f"Processing Mode: {results['processing']['mode']}")
     print(f"Total Files: {results['total_files']}")
     print(f"Analyzed Files: {results['analyzed_files']}")
+    print(f"Files per Batch: {results['processing']['files_per_batch']}")
+    print(f"Total LLM Calls: {results['processing']['llm_calls']}")
     print(f"Total Functions: {results['summary']['total_functions']}")
     print(f"Total Classes: {results['summary']['total_classes']}")
     print(f"Average Complexity: {results['summary']['average_complexity']}")
     print(f"Total Lines: {results['summary']['total_lines']}")
     print(f"Languages: {', '.join(results['summary']['languages'])}")
-    print(f"Batches: {results['processing']['num_batches']}")
-    
-    # Show sample results
-    print("\n" + "="*80)
-    print("SAMPLE ANALYSIS (first 3 files)")
-    print("="*80)
-    
-    for i, (file_path, analysis) in enumerate(list(results['files'].items())[:3], 1):
-        print(f"\n{i}. {os.path.basename(file_path)}")
-        if "error" in analysis:
-            print(f"   ✗ Error: {analysis['error']}")
-        else:
-            print(f"   Language: {analysis.get('language', 'N/A')}")
-            print(f"   Functions: {len(analysis.get('functions', []))}")
-            print(f"   Classes: {len(analysis.get('classes', []))}")
-            print(f"   Complexity: {analysis.get('complexity_score', 0)}")
-            print(f"   Lines: {analysis.get('lines_of_code', 0)}")
 
 
 if __name__ == "__main__":
