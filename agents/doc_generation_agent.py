@@ -13,9 +13,8 @@ import re
 
 
 class DocGenerationAgent(BaseAgent):
-    """Agent for generating Wiki documentation.
-    
-    Inherits from BaseAgent to leverage common workflow patterns.
+    """
+        Agent for generating Wiki documentation.
     """
     
     def __init__(self, repo_path: str = "", wiki_path: str = ""):
