@@ -4,7 +4,7 @@ import RepoDetail from '../pages/RepoDetail.vue'
 
 const routes = [
   { path: '/', name: 'Home', component: Home },
-  { path: '/detail', name: 'RepoDetail', component: RepoDetail }
+  { path: '/detail/:repoId?', name: 'RepoDetail', component: RepoDetail }
 ]
 
 const router = createRouter({

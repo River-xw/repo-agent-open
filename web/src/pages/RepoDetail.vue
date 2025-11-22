@@ -1,14 +1,15 @@
 <template>
   <div class="repo-detail">
+    <ThemeToggle />
     <div class="content-wrapper">
       <aside class="toc">
         <nav>
           <div
-            v-for="(section, si) in sections"
+            v-for="(section, si) in tocSections"
             :key="`sec-${si}`"
             class="toc-section"
           >
-            <div class="toc-title">{{ section.title }}</div>
+            <div class="toc-title" @click="selectTitle(si)" :aria-current="selected.section === si && selected.item === null ? 'true' : undefined">{{ section.title }}</div>
             <div
               v-for="(item, ii) in section.items || []"
               :key="`item-${si}-${ii}`"
@@ -23,7 +24,7 @@
       </aside>
 
       <main class="doc">
-        <div class="doc-inner" ref="docInnerRef" v-html="content || ''"></div>
+        <div class="doc-inner" ref="docInnerRef" v-html="docContent"></div>
         <div v-if="showTop" class="fade fade-top" aria-hidden="true"></div>
         <div v-if="showBottom" class="fade fade-bottom" aria-hidden="true"></div>
       </main>
@@ -31,12 +32,13 @@
 
     <div class="ask-row">
       <div class="ask-box">
-        <input
+        <textarea
           v-model="query"
           class="ask-input"
           :placeholder="placeholder"
           @keydown.enter.prevent="handleSend"
-        />
+          rows="3"
+        ></textarea>
         <button class="send-btn" @click="handleSend">Send-&gt;</button>
       </div>
 
@@ -49,20 +51,18 @@
 
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { useRoute } from 'vue-router'
+import { listDocs, getWikiContent } from '../utils/request'
+import ThemeToggle from '../components/ThemeToggle.vue'
 
-const props = withDefaults(defineProps<{
-  sections?: { title: string; items?: string[] }[]
-  content?: string
-  repoId?: string | null
-  placeholder?: string
-}>(), {
-  sections: () => [
-    { title: 'Introduction', items: ['sec1', 'sec2'] },
-    { title: 'How to use', items: ['sec1', 'sec2'] }
-  ],
-  content: `Title
-  
-Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+const route = useRoute()
+const repoId = ref(route.params.repoId as string || null)
+
+const sections = ref([
+  { title: 'Introduction', items: ['sec1', 'sec2'] },
+  { title: 'How to use', items: ['sec1', 'sec2'] }
+])
+const content = ref(`Title
 
 Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
 
@@ -70,16 +70,16 @@ Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do eiusmod tempor 
 
 Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
 
-Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.`,
-  repoId: null,
-  placeholder: 'Try to ask me...'
-})
+Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
 
-const { sections, content, placeholder } = props
+Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.`)
+const placeholder = ref('Try to ask me...')
 
 const docInnerRef = ref<HTMLElement | null>(null)
 const showTop = ref(false)
 const showBottom = ref(false)
+const docContent = ref(content.value)
+const tocSections = ref(sections.value)
 
 const updateFades = () => {
   const el = docInnerRef.value
@@ -87,9 +87,18 @@ const updateFades = () => {
   showTop.value = el.scrollTop > 0
   // allow tiny rounding tolerance
   showBottom.value = el.scrollHeight > el.clientHeight && (el.scrollTop + el.clientHeight) < (el.scrollHeight - 1)
+
+  // Update selected section based on scroll position
+  const totalSections = tocSections.value.length
+  if (totalSections > 0) {
+    const scrollRatio = el.scrollTop / (el.scrollHeight - el.clientHeight || 1)
+    const currentSection = Math.min(Math.floor(scrollRatio * totalSections), totalSections - 1)
+    selected.value.section = currentSection
+    selected.value.item = null
+  }
 }
 
-onMounted(() => {
+onMounted(async () => {
   nextTick(() => {
     updateFades()
     const el = docInnerRef.value
@@ -97,6 +106,36 @@ onMounted(() => {
     el.addEventListener('scroll', updateFades, { passive: true })
     window.addEventListener('resize', updateFades)
   })
+
+  // Load document list
+  try {
+    const res = await listDocs()
+    if (res.success && Array.isArray(res.data)) {
+      tocSections.value = res.data.map((repo: string) => ({ title: repo, items: [] }))
+      // Set initial selected section
+      if (repoId.value) {
+        const index = tocSections.value.findIndex(s => s.title === repoId.value)
+        if (index >= 0) {
+          selected.value = { section: index, item: null }
+        }
+      }
+    }
+  } catch (e) {
+    console.error('Failed to load docs list:', e)
+  }
+
+  // Load the document content of the current repository
+  if (repoId.value) {
+    try {
+      const html = await getWikiContent(repoId.value)
+      docContent.value = html
+    } catch (e) {
+      console.error('Failed to load wiki content:', e)
+    }
+  }
+
+  // test load
+  docContent.value = content.value
 })
 
 onUnmounted(() => {
@@ -105,15 +144,35 @@ onUnmounted(() => {
   window.removeEventListener('resize', updateFades)
 })
 
-watch(() => content, () => {
-  nextTick(updateFades)
-})
-
 const query = ref('')
 const selected = ref<{ section: number | null; item: number | null }>({ section: null, item: null })
 
 const selectItem = (si: number, ii: number) => {
   selected.value = { section: si, item: ii }
+  // When selecting TOC item, can load the content of the corresponding repository
+  const selectedRepo = tocSections.value[si]?.title
+  if (selectedRepo) {
+    getWikiContent(selectedRepo).then(html => {
+      docContent.value = html
+    }).catch(e => {
+      console.error('Failed to load selected repo content:', e)
+    })
+  }
+}
+
+const selectTitle = (si: number) => {
+  selected.value = { section: si, item: null }
+  const selectedRepo = tocSections.value[si]?.title
+  if (selectedRepo) {
+    getWikiContent(selectedRepo).then(html => {
+      docContent.value = html
+      nextTick(() => {
+        if (docInnerRef.value) docInnerRef.value.scrollTop = 0
+      })
+    }).catch(e => {
+      console.error('Failed to load selected repo content:', e)
+    })
+  }
 }
 
 const emit = defineEmits<{
@@ -180,6 +239,12 @@ const handleSend = () => {
   box-shadow: 0 1px 4px var(--shadow-color);
 }
 
+.toc-title[aria-current='true'] {
+  background: var(--card-bg);
+  border-radius: 6px;
+  box-shadow: 0 1px 4px var(--shadow-color);
+}
+
 .doc {
   flex: 1 1 auto;
   border-left: 1px solid var(--border-color);
@@ -234,8 +299,8 @@ const handleSend = () => {
 .ask-box {
   flex: 1 1 auto;
   display: flex;
-  height: 80px;
-  align-items: center;
+  min-height: 80px;
+  align-items: flex-start;
   background: var(--card-bg);
   border: 2px solid var(--border-color);
   border-radius: 20px;
@@ -250,6 +315,9 @@ const handleSend = () => {
   background: transparent;
   font-size: 16px;
   color: var(--text-color);
+  max-height: 200px;
+  resize: none;
+  overflow-y: auto;
 }
 
 .send-btn {
@@ -258,6 +326,7 @@ const handleSend = () => {
   color: var(--text-color);
   cursor: pointer;
   font-weight: 600;
+  align-self: center;
 }
 
 .new-repo {

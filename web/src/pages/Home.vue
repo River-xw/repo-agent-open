@@ -1,12 +1,6 @@
 <template>
   <div class="home-page">
-    <button
-      class="theme-toggle"
-      @click="toggleTheme"
-      :aria-label="isDarkMode ? 'Switch to light mode' : 'Switch to dark mode'"
-    >
-      <i :class="isDarkMode ? 'fas fa-sun' : 'fas fa-moon'"></i>
-    </button>
+    <ThemeToggle />
     <div class="container">
       <Header />
       <InputSection
@@ -21,38 +15,63 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref } from 'vue'
+import { useRouter } from 'vue-router'
 import Header from '../components/Header.vue'
 import InputSection from '../components/InputSection.vue'
 import InfoCard from '../components/InfoCard.vue'
+import ThemeToggle from '../components/ThemeToggle.vue'
+import { generateDoc } from '../utils/request'
 
+const router = useRouter()
 const repoUrl = ref('')
 const speed = ref('fast')
 const isLoading = ref(false)
-const isDarkMode = ref(false)
 
 const handleSubmit = async () => {
   if (!repoUrl.value) return
   isLoading.value = true
-  // TODO: 发送请求到后端
-  setTimeout(() => {
+  try {
+    const url = repoUrl.value.trim()
+    let owner: string, repo: string
+    if (url.includes('github.com')) {
+      const parts = url.split('/')
+      if (parts.length < 2) throw new Error('Invalid URL')
+      owner = parts[parts.length - 2]!
+      repo = parts[parts.length - 1]!
+    } else {
+      const parts = url.split('/')
+      if (parts.length < 2) throw new Error('Invalid repo format')
+      owner = parts[0]!
+      repo = parts[1]!
+    }
+    if (!owner || !repo) {
+      alert('Invalid repo URL')
+      isLoading.value = false
+      return
+    }
+    const wikiPath = `./.wikis/${owner}_${repo}`
+    const baseURL = import.meta.env.VITE_API_BASE_URL || ''
+    const wikiUrl = `${baseURL}/wikis/${owner}_${repo}`
+    const res = await generateDoc({
+      owner,
+      repo,
+      wiki_path: wikiPath,
+      wiki_url: wikiUrl,
+      files: []
+    })
+    if (res.success) {
+      router.push({ name: 'RepoDetail', params: { repoId: `${owner}_${repo}` } })
+    } else {
+      alert(res.message || 'Failed to generate doc')
+    }
+  } catch (e) {
+    console.error(e)
+    alert('Error occurred')
+  } finally {
     isLoading.value = false
-  }, 1000)
-}
-
-const toggleTheme = () => {
-  isDarkMode.value = !isDarkMode.value
-  document.body.classList.toggle('dark', isDarkMode.value)
-  localStorage.setItem('theme', isDarkMode.value ? 'dark' : 'light')
-}
-
-onMounted(() => {
-  const savedTheme = localStorage.getItem('theme')
-  if (savedTheme === 'dark') {
-    isDarkMode.value = true
-    document.body.classList.add('dark')
   }
-})
+}
 </script>
 
 <style scoped>
@@ -64,35 +83,6 @@ onMounted(() => {
 .app {
   position: relative;
   min-height: 100vh;
-}
-
-.theme-toggle {
-  position: fixed;
-  top: 20px;
-  right: 20px;
-  background: var(--card-bg);
-  border: 1px solid var(--border-color);
-  cursor: pointer;
-  font-size: 16px;
-  padding: 10px;
-  border-radius: 50%;
-  transition: all 0.3s ease;
-  color: var(--text-color);
-  z-index: 1000;
-  box-shadow: 0 2px 8px var(--shadow-color);
-}
-
-.theme-toggle:hover {
-  background: var(--hover-bg);
-  transform: scale(1.05);
-}
-
-.theme-toggle i {
-  transition: transform 0.3s;
-}
-
-.theme-toggle:hover i {
-  transform: scale(1.1);
 }
 
 .container {
