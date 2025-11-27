@@ -4,12 +4,12 @@ import RepoDetail from '../pages/RepoDetail.vue'
 
 const routes = [
   { path: '/', name: 'Home', component: Home },
-  { path: '/detail/:repoId?', name: 'RepoDetail', component: RepoDetail }
+  { path: '/detail/:repoId?', name: 'RepoDetail', component: RepoDetail },
 ]
 
 const router = createRouter({
   history: createWebHistory(),
-  routes
+  routes,
 })
 
 export default router

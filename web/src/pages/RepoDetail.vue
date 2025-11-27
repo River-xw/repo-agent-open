@@ -4,11 +4,7 @@
     <div class="content-wrapper">
       <aside class="toc">
         <nav>
-          <div
-            v-for="(section, si) in tocSections"
-            :key="`sec-${si}`"
-            class="toc-section"
-          >
+          <div v-for="(section, si) in tocSections" :key="`sec-${si}`" class="toc-section">
             <div v-for="(item, ii) in section.items || []" :key="`item-${si}-${ii}`">
               <div
                 class="toc-item"
@@ -16,8 +12,12 @@
                 :aria-current="selected.section === si && selected.item === ii ? 'true' : undefined"
               >
                 <span class="toc-item-name">{{ item.name }}</span>
-                <button class="toc-toggle" @click.stop="toggleExpand(si, ii)" aria-label="Toggle headings">
-                  {{ (item.expanded ? '▾' : '▸') }}
+                <button
+                  class="toc-toggle"
+                  @click.stop="toggleExpand(si, ii)"
+                  aria-label="Toggle headings"
+                >
+                  {{ item.expanded ? '▾' : '▸' }}
                 </button>
               </div>
 
@@ -98,7 +98,7 @@ interface StreamData {
   progress?: number
   wiki_url?: string
   error?: string
-  [key: string]: any
+  [key: string]: unknown
 }
 
 const route = useRoute()
@@ -141,14 +141,13 @@ const md = new MarkdownIt({
   html: true,
   linkify: true,
   typographer: true,
-})
-.use(anchor, {
+}).use(anchor, {
   permalink: false,
   // keep default slugify behavior
 })
 
 const renderMarkdown = (markdown: string) => {
-  const env: Record<string, any> = {}
+  const env: Record<string, unknown> = {}
   const html = md.render(markdown, env)
 
   // parse tokens to extract headings and their ids
@@ -161,7 +160,8 @@ const renderMarkdown = (markdown: string) => {
       // try to find id in attrs
       let id = ''
       if (Array.isArray(t.attrs)) {
-        const idAttr = t.attrs.find((a: any) => a[0] === 'id')
+        const attrs = t.attrs as [string, string][]
+        const idAttr = attrs.find((a) => a[0] === 'id')
         if (idAttr) id = String(idAttr[1])
       }
       // next token should be inline with content
@@ -174,12 +174,20 @@ const renderMarkdown = (markdown: string) => {
   return { html, headings }
 }
 
-const attachHeadingsToResolvedUrl = (section: TocSection, fileUrl: string, headings: { level: number; title: string; id: string }[] | undefined) => {
+const attachHeadingsToResolvedUrl = (
+  section: TocSection,
+  fileUrl: string,
+  headings: { level: number; title: string; id: string }[] | undefined
+) => {
   if (!section || !section.items || !fileUrl || !headings || !headings.length) return
   const resolved = resolveBackendStaticUrl(String(fileUrl))
   for (const it of section.items) {
     if (it.url === resolved) {
-      ;(it as FileItem).headings = headings.map(h => ({ level: h.level, title: h.title, id: h.id }))
+      ;(it as FileItem).headings = headings.map((h) => ({
+        level: h.level,
+        title: h.title,
+        id: h.id,
+      }))
       break
     }
   }
@@ -256,7 +264,7 @@ async function loadDocumentation(section: TocSection, needUpdate = false) {
   try {
     const lastEvent = await generateDocStream(
       { owner: section.owner, repo: section.repo, need_update: needUpdate },
-      async (event: BaseResponse<any>) => {
+      async (event: BaseResponse<unknown>) => {
         if (!event) return
 
         if (event.code !== 200) {
@@ -290,94 +298,115 @@ async function loadDocumentation(section: TocSection, needUpdate = false) {
         }
 
         if (data?.wiki_url) {
-                progressLogs.value.push('Documentation ready.')
+          progressLogs.value.push('Documentation ready.')
+          renderProgress()
+          // Render generated file list (do not fetch from /wikis)
+          const files = (data.files as unknown[]) || []
+          if (files.length === 1) {
+            // Directly load the single file
+            const file = files[0] as Record<string, unknown>
+            const url = typeof file.url === 'string' ? file.url : undefined
+            let fileHeadings: HeadingItem[] | undefined = undefined
+            let resolvedUrl = ''
+            if (url) {
+              try {
+                const resolved = resolveBackendStaticUrl(url)
+                resolvedUrl = resolved
+                progressLogs.value.push(`Loading file from ${resolved}`)
                 renderProgress()
-                // Render generated file list (do not fetch from /wikis)
-                const files = (data.files as any[]) || []
-                if (files.length === 1) {
-                  // Directly load the single file
-                  const file = files[0]
-                  const url = file.url
-                  let fileHeadings: HeadingItem[] | undefined = undefined
-                  let resolvedUrl = ''
-                  if (url) {
-                    try {
-                      const resolved = resolveBackendStaticUrl(url)
-                      resolvedUrl = resolved
-                      progressLogs.value.push(`Loading file from ${resolved}`)
-                      renderProgress()
-                      const response = await fetch(resolved)
-                      if (response.ok) {
-                        const content = await response.text()
-                        // If looks like markdown, render HTML + extract headings
-                        const isMd = typeof url === 'string' && /\.md$/i.test(url)
-                        if (isMd || content.trim().startsWith('#') || content.includes('\n# ')) {
-                          const { html, headings } = renderMarkdown(content)
-                          docContent.value = html
-                          fileHeadings = headings.map(h => ({ level: h.level, title: h.title, id: h.id }))
-                          const title = extractTitleFromMarkdown(content)
-                          section.title = title || section.repo
-                        } else {
-                          docContent.value = `<pre>${escapeHtml(content)}</pre>`
-                          const title = extractTitleFromMarkdown(content)
-                          if (title) {
-                            section.title = title
-                          } else {
-                            section.title = section.repo
-                          }
-                        }
-                      } else {
-                        docContent.value = `<p>Failed to load document: ${response.status}</p>`
-                      }
-                    } catch (error) {
-                      docContent.value = `<p>Error loading document: ${String(error)}</p>`
-                    }
-                  }
-                  // Populate TOC with the single file (resolve to backend full URL)
-                  section.items = files.map(f => {
-                    const u = resolveBackendStaticUrl(String(f.url || ''))
-                    return { name: String(f.path || f.name || f.url || 'file'), url: u, headings: u === resolvedUrl ? fileHeadings : undefined }
-                  })
-                } else if (files.length > 1) {
-                  const listHtml = `<h3>Generated Files (${files.length})</h3><ul>${files
-                    .map(f => `<li><a href="#" data-url="${escapeHtml(String(f.url || ''))}">${escapeHtml(String(f.path || f.name || f.url || 'file'))}</a></li>`)
-                    .join('')}</ul>`
-                  docContent.value = listHtml
-                  // Update TOC with files (resolve to backend full URL immediately)
-                  section.items = files.map(f => ({ name: String(f.path || f.name || f.url || 'file'), url: resolveBackendStaticUrl(String(f.url || '')) }))
-                } else {
-                  docContent.value = `<pre>${escapeHtml(JSON.stringify(data, null, 2))}</pre>`
-                }
-                loadedFromStream = true
-                await nextTick()
-                if (docInnerRef.value) {
-                  docInnerRef.value.scrollTop = 0
-                }
-                updateFades()
-
-                // Fetch title from first file if available (only for multiple files)
-                if (files.length > 1 && files.length > 0) {
-                  const firstFile = files[0]
-                  const url = firstFile.url
-                  if (url) {
-                    try {
-                      const resolved = resolveBackendStaticUrl(url)
-                      const response = await fetch(resolved)
-                      if (response.ok) {
-                        const content = await response.text()
-                        const title = extractTitleFromMarkdown(content)
-                        if (title) {
-                          section.title = title
-                        } else {
-                          section.title = section.repo
-                        }
-                      }
-                    } catch (e) {
-                      console.error('Failed to fetch title:', e)
+                const response = await fetch(resolved)
+                if (response.ok) {
+                  const content = await response.text()
+                  // If looks like markdown, render HTML + extract headings
+                  const isMd = typeof url === 'string' && /\.md$/i.test(url)
+                  if (isMd || content.trim().startsWith('#') || content.includes('\n# ')) {
+                    const { html, headings } = renderMarkdown(content)
+                    docContent.value = html
+                    fileHeadings = headings.map((h) => ({
+                      level: h.level,
+                      title: h.title,
+                      id: h.id,
+                    }))
+                    const title = extractTitleFromMarkdown(content)
+                    section.title = title || section.repo
+                  } else {
+                    docContent.value = `<pre>${escapeHtml(content)}</pre>`
+                    const title = extractTitleFromMarkdown(content)
+                    if (title) {
+                      section.title = title
+                    } else {
                       section.title = section.repo
                     }
                   }
+                } else {
+                  docContent.value = `<p>Failed to load document: ${response.status}</p>`
                 }
+              } catch (error) {
+                docContent.value = `<p>Error loading document: ${String(error)}</p>`
+              }
+            }
+            // Populate TOC with the single file (resolve to backend full URL)
+            section.items = (files as unknown[]).map((f) => {
+              const rec = f as Record<string, unknown>
+              const urlVal = typeof rec.url === 'string' ? rec.url : String(rec.url ?? '')
+              const u = resolveBackendStaticUrl(String(urlVal))
+              return {
+                name: String(rec.path ?? rec.name ?? rec.url ?? 'file'),
+                url: u,
+                headings: u === resolvedUrl ? fileHeadings : undefined,
+              }
+            })
+          } else if (files.length > 1) {
+            const listHtml = `<h3>Generated Files (${files.length})</h3><ul>${(files as unknown[])
+              .map((f) => {
+                const rec = f as Record<string, unknown>
+                return `<li><a href="#" data-url="${escapeHtml(String(rec.url ?? ''))}">${escapeHtml(
+                  String(rec.path ?? rec.name ?? rec.url ?? 'file')
+                )}</a></li>`
+              })
+              .join('')}</ul>`
+            docContent.value = listHtml
+            // Update TOC with files (resolve to backend full URL immediately)
+            section.items = (files as unknown[]).map((f) => {
+              const rec = f as Record<string, unknown>
+              return {
+                name: String(rec.path ?? rec.name ?? rec.url ?? 'file'),
+                url: resolveBackendStaticUrl(String(rec.url ?? '')),
+              }
+            })
+          } else {
+            docContent.value = `<pre>${escapeHtml(JSON.stringify(data, null, 2))}</pre>`
+          }
+          loadedFromStream = true
+          await nextTick()
+          if (docInnerRef.value) {
+            docInnerRef.value.scrollTop = 0
+          }
+          updateFades()
+
+          // Fetch title from first file if available (only for multiple files)
+          if (files.length > 1 && files.length > 0) {
+            const firstFile = files[0] as Record<string, unknown>
+            const url = typeof firstFile.url === 'string' ? firstFile.url : undefined
+            if (url) {
+              try {
+                const resolved = resolveBackendStaticUrl(String(url))
+                const response = await fetch(resolved)
+                if (response.ok) {
+                  const content = await response.text()
+                  const title = extractTitleFromMarkdown(content)
+                  if (title) {
+                    section.title = title
+                  } else {
+                    section.title = section.repo
+                  }
+                }
+              } catch (e) {
+                console.error('Failed to fetch title:', e)
+                section.title = section.repo
+              }
+            }
+          }
         }
       },
       { signal: controller.signal }
@@ -386,37 +415,43 @@ async function loadDocumentation(section: TocSection, needUpdate = false) {
     if (!loadedFromStream && lastEvent?.code === 200) {
       const data = lastEvent.data as StreamData | undefined
       // Render files or data summary instead of fetching /wikis
-      const files = (data as any)?.files || []
+      const files = (data as unknown as Record<string, unknown>)?.files || []
       if (Array.isArray(files) && files.length === 1) {
         // Directly load the single file
-        const file = files[0]
-        const url = file.url
+        const file = files[0] as Record<string, unknown>
+        const url = typeof file.url === 'string' ? file.url : undefined
         if (url) {
           try {
             const response = await fetch(resolveBackendStaticUrl(url))
             if (response.ok) {
-                    const content = await response.text()
-                    const isMd = typeof url === 'string' && /\.md$/i.test(url)
-                    let fileHeadings: HeadingItem[] | undefined = undefined
-                    let resolvedUrl = ''
-                    if (url) resolvedUrl = resolveBackendStaticUrl(url)
-                    if (isMd || content.trim().startsWith('#') || content.includes('\n# ')) {
-                      const { html, headings } = renderMarkdown(content)
-                      docContent.value = html
-                      fileHeadings = headings.map(h => ({ level: h.level, title: h.title, id: h.id }))
-                      const title = extractTitleFromMarkdown(content)
-                      section.title = title || section.repo
-                    } else {
-                      docContent.value = `<pre>${escapeHtml(content)}</pre>`
-                      const title = extractTitleFromMarkdown(content)
-                      if (title) section.title = title
-                      else section.title = section.repo
-                    }
-                    // populate TOC linking and attach headings if present
-                    section.items = files.map(f => {
-                      const u = resolveBackendStaticUrl(String(f.url || ''))
-                      return { name: String(f.path || f.name || f.url || 'file'), url: u, headings: u === resolvedUrl ? fileHeadings : undefined }
-                    })
+              const content = await response.text()
+              const isMd = typeof url === 'string' && /\.md$/i.test(url)
+              let fileHeadings: HeadingItem[] | undefined = undefined
+              let resolvedUrl = ''
+              if (url) resolvedUrl = resolveBackendStaticUrl(url)
+              if (isMd || content.trim().startsWith('#') || content.includes('\n# ')) {
+                const { html, headings } = renderMarkdown(content)
+                docContent.value = html
+                fileHeadings = headings.map((h) => ({ level: h.level, title: h.title, id: h.id }))
+                const title = extractTitleFromMarkdown(content)
+                section.title = title || section.repo
+              } else {
+                docContent.value = `<pre>${escapeHtml(content)}</pre>`
+                const title = extractTitleFromMarkdown(content)
+                if (title) section.title = title
+                else section.title = section.repo
+              }
+              // populate TOC linking and attach headings if present
+              section.items = (files as unknown[]).map((f) => {
+                const rec = f as Record<string, unknown>
+                const urlVal = typeof rec.url === 'string' ? rec.url : String(rec.url ?? '')
+                const u = resolveBackendStaticUrl(String(urlVal))
+                return {
+                  name: String(rec.path ?? rec.name ?? rec.url ?? 'file'),
+                  url: u,
+                  headings: u === resolvedUrl ? fileHeadings : undefined,
+                }
+              })
             } else {
               docContent.value = `<p>Failed to load document: ${response.status}</p>`
             }
@@ -425,13 +460,28 @@ async function loadDocumentation(section: TocSection, needUpdate = false) {
           }
         }
         // Populate TOC with the single file (resolve to backend full URL)
-        section.items = files.map((f: any) => ({ name: String(f.path || f.name || f.url || 'file'), url: resolveBackendStaticUrl(String(f.url || '')) }))
+        section.items = (files as unknown[]).map((f) => {
+          const rec = f as Record<string, unknown>
+          return {
+            name: String(rec.path ?? rec.name ?? rec.url ?? 'file'),
+            url: resolveBackendStaticUrl(String(rec.url ?? '')),
+          }
+        })
       } else if (Array.isArray(files) && files.length > 1) {
-        docContent.value = `<h3>Generated Files (${files.length})</h3><ul>${files
-          .map((f: any) => `<li>${escapeHtml(String(f.path || f.name || f.url || 'file'))}</li>`)
+        docContent.value = `<h3>Generated Files (${files.length})</h3><ul>${(files as unknown[])
+          .map((f) => {
+            const rec = f as Record<string, unknown>
+            return `<li>${escapeHtml(String(rec.path ?? rec.name ?? rec.url ?? 'file'))}</li>`
+          })
           .join('')}</ul>`
         // Update TOC with files (resolve to backend full URL immediately)
-        section.items = files.map((f: any) => ({ name: String(f.path || f.name || f.url || 'file'), url: resolveBackendStaticUrl(String(f.url || '')) }))
+        section.items = (files as unknown[]).map((f) => {
+          const rec = f as Record<string, unknown>
+          return {
+            name: String(rec.path ?? rec.name ?? rec.url ?? 'file'),
+            url: resolveBackendStaticUrl(String(rec.url ?? '')),
+          }
+        })
       } else {
         docContent.value = `<pre>${escapeHtml(JSON.stringify(data || lastEvent, null, 2))}</pre>`
       }
@@ -443,11 +493,11 @@ async function loadDocumentation(section: TocSection, needUpdate = false) {
 
       // Fetch title from first file if available (only for multiple files)
       if (Array.isArray(files) && files.length > 1 && files.length > 0) {
-        const firstFile = files[0]
-        const url = firstFile.url
+        const firstFile = files[0] as Record<string, unknown>
+        const url = typeof firstFile.url === 'string' ? firstFile.url : undefined
         if (url) {
           try {
-            const response = await fetch(resolveBackendStaticUrl(url))
+            const response = await fetch(resolveBackendStaticUrl(String(url)))
             if (response.ok) {
               const content = await response.text()
               const title = extractTitleFromMarkdown(content)
@@ -468,8 +518,7 @@ async function loadDocumentation(section: TocSection, needUpdate = false) {
     if (controller.signal.aborted) {
       return
     }
-    const message =
-      error instanceof Error ? error.message : 'Failed to stream documentation.'
+    const message = error instanceof Error ? error.message : 'Failed to stream documentation.'
     progressLogs.value.push(message)
     renderProgress()
     console.error('Failed to stream documentation:', error)
@@ -503,25 +552,28 @@ const selectRepoById = (id: string, needUpdate = false) => {
 
 let lastHandledRepoId: string | null = null
 
-watch(() => route.params.repoId, (newRepoId) => {
-  const id = typeof newRepoId === 'string' ? newRepoId : ''
-  if (id === lastHandledRepoId) {
+watch(
+  () => route.params.repoId,
+  (newRepoId) => {
+    const id = typeof newRepoId === 'string' ? newRepoId : ''
+    if (id === lastHandledRepoId) {
+      repoId.value = id
+      return
+    }
+
     repoId.value = id
-    return
-  }
 
-  repoId.value = id
+    if (!id) {
+      progressLogs.value = []
+      docContent.value = '<p>Select a repository to view documentation.</p>'
+      lastHandledRepoId = id
+      return
+    }
 
-  if (!id) {
-    progressLogs.value = []
-    docContent.value = '<p>Select a repository to view documentation.</p>'
     lastHandledRepoId = id
-    return
+    selectRepoById(id)
   }
-
-  lastHandledRepoId = id
-  selectRepoById(id)
-})
+)
 
 watch(docContent, () => {
   nextTick(() => updateFades())
@@ -565,30 +617,34 @@ const selectItem = async (si: number, ii: number) => {
     renderProgress()
     const response = await fetch(resolved)
     if (response.ok) {
-        const content = await response.text()
-        // If this item is an intra-doc link (#id), scroll to it instead
-        if (item.url.startsWith('#')) {
-          const id = item.url.slice(1)
-          await nextTick()
-          const container = docInnerRef.value
-          if (container) {
-            const el = container.querySelector(`#${CSS.escape(id)}`)
-            if (el) {
-              el.scrollIntoView({ behavior: 'smooth', block: 'start' })
-            }
+      const content = await response.text()
+      // If this item is an intra-doc link (#id), scroll to it instead
+      if (item.url.startsWith('#')) {
+        const id = item.url.slice(1)
+        await nextTick()
+        const container = docInnerRef.value
+        if (container) {
+          const el = container.querySelector(`#${CSS.escape(id)}`)
+          if (el) {
+            el.scrollIntoView({ behavior: 'smooth', block: 'start' })
           }
-          return
         }
-        // Render markdown or plain text
-        const isMd = typeof item.url === 'string' && /\.md$/i.test(item.url)
-        if (isMd || content.trim().startsWith('#') || content.includes('\n# ')) {
-          const { html, headings } = renderMarkdown(content)
-          docContent.value = html
-          // store headings on the file item so sidebar can show them
-          ;(item as FileItem).headings = headings.map(h => ({ level: h.level, title: h.title, id: h.id }))
-        } else {
-          docContent.value = `<pre>${escapeHtml(content)}</pre>`
-        }
+        return
+      }
+      // Render markdown or plain text
+      const isMd = typeof item.url === 'string' && /\.md$/i.test(item.url)
+      if (isMd || content.trim().startsWith('#') || content.includes('\n# ')) {
+        const { html, headings } = renderMarkdown(content)
+        docContent.value = html
+        // store headings on the file item so sidebar can show them
+        ;(item as FileItem).headings = headings.map((h) => ({
+          level: h.level,
+          title: h.title,
+          id: h.id,
+        }))
+      } else {
+        docContent.value = `<pre>${escapeHtml(content)}</pre>`
+      }
       await nextTick()
       if (docInnerRef.value) {
         docInnerRef.value.scrollTop = 0

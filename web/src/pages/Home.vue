@@ -50,7 +50,7 @@ const handleSubmit = async () => {
       isLoading.value = false
       return
     }
-    
+
     // Always start streaming generation and navigate to the RepoDetail page
     // The RepoDetail page will handle the streaming results and display progress
     const controller = new AbortController()
