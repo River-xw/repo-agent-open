@@ -6,7 +6,7 @@
       <Header />
       <InputSection
         v-model:url="repoUrl"
-        v-model:speed="speed"
+        v-model:mode="mode"
         :loading="isLoading"
         @submit="handleSubmit"
       />
@@ -27,7 +27,7 @@ import { generateDocStream } from '../utils/request'
 
 const router = useRouter()
 const repoUrl = ref('')
-const speed = ref('fast')
+const mode = ref<'sub' | 'moe'>('sub')
 const isLoading = ref(false)
 
 const handleSubmit = async () => {
@@ -35,18 +35,35 @@ const handleSubmit = async () => {
   isLoading.value = true
   try {
     const url = repoUrl.value.trim()
-    let owner: string, repo: string
+    let owner: string,
+      repo: string,
+      platform: string = 'github'
+
+    // Parse URL to extract owner, repo, and platform
     if (url.includes('github.com')) {
-      const parts = url.split('/')
-      if (parts.length < 2) throw new Error('Invalid URL')
-      owner = parts[parts.length - 2]!
-      repo = parts[parts.length - 1]!
+      platform = 'github'
+      // Extract path after github.com
+      const match = url.match(/github\.com\/([^/]+)\/([^/\s]+)/)
+      if (!match || match.length < 3) throw new Error('Invalid GitHub URL')
+      owner = match[1]!
+      repo = match[2]!.replace(/\.git$/, '') // Remove .git suffix if present
+    } else if (url.includes('gitee.com')) {
+      platform = 'gitee'
+      // Extract path after gitee.com
+      const match = url.match(/gitee\.com\/([^/]+)\/([^/\s]+)/)
+      if (!match || match.length < 3) throw new Error('Invalid Gitee URL')
+      owner = match[1]!
+      repo = match[2]!.replace(/\.git$/, '') // Remove .git suffix if present
     } else {
-      const parts = url.split('/')
+      // Try to parse as owner/repo format
+      const parts = url.split('/').filter((part) => part)
       if (parts.length < 2) throw new Error('Invalid repo format')
       owner = parts[0]!
-      repo = parts[1]!
+      repo = parts[1]!.replace(/\.git$/, '')
+      // Default to github for owner/repo format
+      platform = 'github'
     }
+
     if (!owner || !repo) {
       alert('Invalid repo URL')
       isLoading.value = false
@@ -57,10 +74,16 @@ const handleSubmit = async () => {
     // The RepoDetail page will handle the streaming results and display progress
     const controller = new AbortController()
     // Fire-and-forget the stream; RepoDetail will create its own stream when mounted.
-    generateDocStream({ owner, repo }, () => {}, { signal: controller.signal }).catch((e) => {
+    generateDocStream({ mode: mode.value, request: { owner, repo, platform } }, () => {}, {
+      signal: controller.signal,
+    }).catch((e) => {
       console.error('Stream start error:', e)
     })
-    router.push({ name: 'RepoDetail', params: { repoId: `${owner}_${repo}` } })
+    router.push({
+      name: 'RepoDetail',
+      params: { repoId: `${owner}_${repo}` },
+      query: { mode: mode.value, platform },
+    })
   } catch (e) {
     console.error(e)
     alert('Error occurred')
