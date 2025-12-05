@@ -1,5 +1,9 @@
 from langchain_core.runnables.graph import MermaidDrawMethod
+from langchain_core.messages import BaseMessage
 from datetime import datetime
+from typing import List
+import tiktoken
+import requests
 import json
 import os
 
@@ -10,7 +14,10 @@ from utils.repo import (
 )
 from utils.file import (
     read_json,
+    get_ignore_dirs,
+    get_ignore_extensions,
 )
+from config import CONFIG
 
 
 def draw_graph(graph):
@@ -50,7 +57,7 @@ def log_state(state: dict):
 
 
 def get_updated_commit_info(
-    owner: str, repo: str, platform: str, log_path: str
+    owner: str, repo: str, platform: str, log_path: str, max_num: int = 10
 ) -> tuple[bool, dict]:
     # this func is to get updated commits since last doc generation
     # return bool and commit_info dict
@@ -59,6 +66,7 @@ def get_updated_commit_info(
         owner=owner,
         repo=repo,
         platform=platform,
+        max_num=max_num,
     )
     # commit_info contains `repo_info`, "commits_count`, `commits`
     commits = commit_info.get("commits", [])
@@ -94,7 +102,7 @@ def get_updated_commit_info(
 
 
 def get_updated_pr_info(
-    owner: str, repo: str, platform: str, log_path: str
+    owner: str, repo: str, platform: str, log_path: str, limit: int = 10
 ) -> tuple[bool, dict]:
     # this func is to get updated prs since last doc generation
     # return bool and pr_info dict
@@ -103,6 +111,7 @@ def get_updated_pr_info(
         owner=owner,
         repo=repo,
         platform=platform,
+        limit=limit,
     )
     # pr_info contains `repo`, `prs_count`, `prs`
     prs = pr_info.get("prs", [])
@@ -136,7 +145,7 @@ def get_updated_pr_info(
 
 
 def get_updated_release_note_info(
-    owner: str, repo: str, platform: str, log_path: str
+    owner: str, repo: str, platform: str, log_path: str, limit: int = 10
 ) -> tuple[bool, dict]:
     # this func is to get updated release notes since last doc generation
     # return bool and release_note_info dict
@@ -145,6 +154,7 @@ def get_updated_release_note_info(
         owner=owner,
         repo=repo,
         platform=platform,
+        limit=limit,
     )
     # release_note_info contains `repo`, `releases_count`, `releases`
     releases = release_note_info.get("releases", [])
@@ -193,3 +203,192 @@ def get_updated_code_files(
             if file_path:
                 updated_code_files.add(f"{repo_path}/{file_path}")
     return True, list(updated_code_files)
+
+
+def compare_size_between_content_and_analysis(
+    content: str, formatted_analysis: str
+) -> str:
+    # this func is to compare the size between content and analysis
+    content_size = len(content)
+    analysis_size = len(formatted_analysis)
+    if content_size <= analysis_size:
+        return "content"
+    else:
+        return "analysis"
+
+
+def get_repo_structure(repo_path: str) -> List[str]:
+    """Get the structure of a repository, returning a list of file paths.
+
+    Args:
+        repo_path (str): The path to the repository.
+    Returns:
+        List[str]: A list of file paths in the repository.
+    """
+    ignore_dirs = get_ignore_dirs(repo_path)
+    ignore_extensions = get_ignore_extensions()
+    file_paths = []
+    for root, dirs, files in os.walk(repo_path):
+        # Modify dirs in-place to skip ignored directories
+        dirs[:] = [d for d in dirs if d not in ignore_dirs]
+        for file in files:
+            if not any(file.endswith(ext) for ext in ignore_extensions):
+                full_path = os.path.join(root, file)
+                rel_path = os.path.relpath(full_path, repo_path)
+                file_paths.append(rel_path)
+    return file_paths
+
+
+def get_basic_repo_structure(repo_path: str) -> List[str]:
+    """
+    Get the structure of a repository, returning a list of directory paths.
+
+    Args:
+        repo_path (str): The path to the repository.
+    Returns:
+        List[str]: A list of directory paths in the repository.
+    """
+    ignore_dirs = get_ignore_dirs(repo_path)
+    result_dirs = []
+    for root, dirs, _ in os.walk(repo_path):
+        # Filter dirs in-place to skip ignored directories in os.walk
+        dirs[:] = [d for d in dirs if d not in ignore_dirs]
+        # Collect the filtered directories with full paths
+        for d in dirs:
+            full_path = os.path.join(root, d)
+            # Make path relative to repo_path
+            rel_path = os.path.relpath(full_path, repo_path)
+            result_dirs.append(rel_path)
+    return sorted(result_dirs)
+
+
+def call_llm(prompt: List[BaseMessage]) -> str:
+    llm = CONFIG.get_llm()
+    response = llm.invoke(prompt)
+    return response.content
+
+
+def count_tokens(content: str) -> int:
+    encoding = tiktoken.get_encoding("cl100k_base")
+    return len(encoding.encode(content))
+
+
+def get_llm_max_tokens(compress_ratio: float = 0.90) -> int:
+    # get the max tokens of the llm
+    model_name = CONFIG.LLM_MODEL
+    tokens = 128_000
+    match model_name:
+        case "gpt-4o":
+            tokens = 128_000
+        case "claude-4.5-sonnet":
+            tokens = 200_000
+        case "deepseek-chat":
+            tokens = 128_000
+        case "gemini-2.5-pro":
+            tokens = 1_000_000
+        case "qwen2.5:7b":
+            tokens = 32_000
+        case "MiniMax-M2":
+            tokens = 128_000
+        case "GLM-4.5":
+            tokens = 128_000
+        case _:
+            pass
+    return int(tokens * compress_ratio)
+
+
+def get_md_files(given_path: str) -> List[str]:
+    # get all md files in the given path
+    # p.s. remove the ignored directories and files
+    ignore_dirs = get_ignore_dirs(given_path)
+    md_files: List[str] = []
+
+    for root, dirs, files in os.walk(given_path):
+        # filter out ignored directories in-place for os.walk
+        dirs[:] = [d for d in dirs if d not in ignore_dirs]
+
+        for file in files:
+            lower_name = file.lower()
+            if (
+                lower_name.endswith(".md")
+                or lower_name.endswith(".mdx")
+                or lower_name.endswith(".markdown")
+            ):
+                full_path = os.path.join(root, file)
+                rel_path = os.path.relpath(full_path, given_path)
+                md_files.append(rel_path)
+
+    return sorted(md_files)
+
+
+def curl_content(given_url: str) -> str:
+    # use curl to get the content of the file
+    # like "https://github.com/facebook/react/pull/35280.diff"
+    response = requests.get(given_url)
+    return response.text
+
+
+if __name__ == "__main__":
+    repo_path = "./.repos/facebook_react"
+    # basic_repo_structure = get_basic_repo_structure(repo_path)
+    # repo_structure = get_repo_structure(repo_path)
+    # print(repo_structure)
+    # file_path = "./.repos/facebook_zstd/lib/compress/zstd_compress.c"
+    # from utils.file import read_file
+    # content = read_file(file_path)
+    # print(count_tokens(content))
+    # from .utils import get_repo_structure
+
+    # repo_structure = get_repo_structure(repo_path)
+    # print(repo_structure)
+    # print(count_tokens(str(repo_structure)))
+
+    basic_repo_structure = get_basic_repo_structure(repo_path)
+    print(basic_repo_structure)
+    print(len(basic_repo_structure))
+    print(count_tokens(str(basic_repo_structure)))
+    print("--------------------------------")
+
+    # md_files = get_md_files(repo_path)
+    # print(md_files)
+    # print(len(md_files))
+    # print(count_tokens(str(md_files)))
+    # print("--------------------------------")
+
+    # commit_info = get_updated_commit_info(
+    #     owner="facebook",
+    #     repo="react",
+    #     platform="github",
+    #     log_path="./.logs/commit_log.json",
+    #     max_num=5,
+    # )
+    # print(json.dumps(commit_info, indent=2, default=str))
+    # print(count_tokens(json.dumps(commit_info, indent=2, default=str)))
+    # print("--------------------------------")
+
+    # pr_info = get_updated_pr_info(
+    #     owner="facebook",
+    #     repo="react",
+    #     platform="github",
+    #     log_path="./.logs/pr_log.json",
+    #     limit=5,
+    # )
+    # print(json.dumps(pr_info, indent=2, default=str))
+    # print(count_tokens(json.dumps(pr_info, indent=2, default=str)))
+    # print("--------------------------------")
+
+    # curled_content = curl_content("https://github.com/facebook/react/pull/35280.diff")
+    # print(curled_content)
+    # print(count_tokens(curled_content))
+    # print("--------------------------------")
+
+    # release_note_info = get_updated_release_note_info(
+    #     owner="facebook",
+    #     repo="react",
+    #     platform="github",
+    #     log_path="./.logs/release_note_log.json",
+    #     limit=5,
+    # )
+    # print(json.dumps(release_note_info, indent=2, default=str))
+    # print(count_tokens(json.dumps(release_note_info, indent=2, default=str)))
+    # print("--------------------------------")

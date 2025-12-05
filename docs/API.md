@@ -43,6 +43,7 @@ Generate or update the agent documentation for a repository.
 ```
 
 **Mode Parameter:**
+
 - `"sub"`: Use ParentGraphBuilder
 - `"moe"`: Use MoeAgent
 
@@ -92,7 +93,8 @@ data: {"message": "string", "code": 200, "data": {...}}
 
 **Progress Stages by Mode:**
 
-*Sub mode (`"mode": "sub"`):*
+_Sub mode (`"mode": "sub"`):_
+
 - `started` (0%): Starting documentation generation
 - `basic_info_node` (15%): Processing basic information
 - `check_update_node` (35%): Checking for updates
@@ -100,7 +102,8 @@ data: {"message": "string", "code": 200, "data": {...}}
 - `code_analysis_graph` (85%): Analyzing code
 - `completed` (100%): Documentation generation completed
 
-*Moe mode (`"mode": "moe"`):*
+_Moe mode (`"mode": "moe"`):_
+
 - `started` (0%): Starting MoeAgent documentation generation
 - `repo_info` (10%): Collecting repository information
 - `file_selection` (25%): Selecting important files
@@ -255,7 +258,19 @@ curl -X POST http://localhost:8000/api/v1/agents/generate \
 ```bash
 curl -N http://localhost:8000/api/v1/agents/generate-stream \
   -X POST -H "Content-Type: application/json" \
-  -d '{"owner": "octocat", "repo": "Hello-World"}'
+  -d '{
+    "mode": "sub",
+    "request": {
+      "owner": "facebook",
+      "repo": "zstd",
+      "platform": "github",
+      "need_update": false,
+      "branch_mode": "all",
+      "mode": "fast",
+      "max_workers": 50,
+      "log": false
+    }
+  }'
 ```
 
 ### List Documentation
@@ -270,8 +285,8 @@ curl http://localhost:8000/api/v1/agents/list
 curl -X POST http://localhost:8000/api/v1/rag/ask \
   -H "Content-Type: application/json" \
   -d '{
-    "owner": "octocat",
-    "repo": "Hello-World",
+    "owner": "facebook",
+    "repo": "zstd",
     "platform": "github",
     "mode": "fast",
     "question": "What does this repository do?"
@@ -290,8 +305,8 @@ curl "http://localhost:8000/api/v1/agents/wikis/octocat/Hello-World?mode=sub"
 curl -N http://localhost:8000/api/v1/rag/ask-stream \
   -H "Content-Type: application/json" \
   -d '{
-    "owner": "octocat",
-    "repo": "Hello-World",
+    "owner": "facebook",
+    "repo": "zstd",
     "platform": "github",
     "mode": "fast",
     "question": "Where is the main entrypoint of this project?"

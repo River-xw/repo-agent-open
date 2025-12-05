@@ -1,42 +1,20 @@
 from typing_extensions import TypedDict
 from langgraph.checkpoint.memory import MemorySaver
-from langchain_core.runnables.graph import MermaidDrawMethod
 from langgraph.graph.state import StateGraph, START
-from langchain_core.messages import HumanMessage, SystemMessage
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import asyncio
-import json
 import os
 import time
 
-from utils.repo import (
-    get_repo_info,
-    get_repo_commit_info,
-    get_commits,
-    get_pr,
-    get_pr_files,
-    get_release_note,
-)
-from utils.file import (
-    get_repo_structure,
-    write_file,
-    read_file,
-    resolve_path,
-    read_json,
-)
-from utils.code_analyzer import (
-    analyze_file_with_tree_sitter,
-    format_tree_sitter_analysis_results,
-    format_tree_sitter_analysis_results_to_prompt,
-)
+from utils.repo import get_repo_info
 from .utils import (
-    draw_graph,
     log_state,
     get_updated_commit_info,
     get_updated_pr_info,
     get_updated_release_note_info,
     get_updated_code_files,
+    get_repo_structure,
+    get_basic_repo_structure,
 )
 from .repo import RepoInfoSubGraphBuilder
 from .code import CodeAnalysisSubGraphBuilder
@@ -49,6 +27,7 @@ class ParentGraphState(TypedDict):
     repo: str
     platform: str
     mode: str
+    ratios: dict[str, float]
     max_workers: int
     date: str
     log: bool
@@ -81,6 +60,7 @@ class ParentGraphBuilder:
         repo: str,
         platform: str,
         mode: str,
+        ratios: dict[str, float],
         max_workers: int,
         repo_root_path: str,
         wiki_root_path: str,
@@ -100,6 +80,7 @@ class ParentGraphBuilder:
         print(f"📦 Repository: {owner}/{repo}")
         print(f"🔗 Platform: {platform}")
         print(f"⚙️ Mode: {mode}")
+        print(f"🔢 Ratios: {ratios}")
         print(f"👷 Max Workers: {max_workers}")
         print(f"📁 Repo Root Path: {repo_root_path}")
         print(f"📁 Repo Path: {repo_path}")
@@ -118,10 +99,12 @@ class ParentGraphBuilder:
         repo: str,
         platform: str,
         mode: str,
+        ratios: dict[str, float],
         max_workers: int,
         date: str,
         log: bool,
         repo_info: dict | None,
+        basic_repo_structure: list[str] | None,
         repo_structure: dict | None,
         repo_root_path: str,
         wiki_root_path: str,
@@ -141,6 +124,7 @@ class ParentGraphBuilder:
             "repo": repo,
             "platform": platform,
             "mode": mode,
+            "ratios": ratios,
             "max_workers": max_workers,
             "date": date,
             "log": log,
@@ -149,6 +133,7 @@ class ParentGraphBuilder:
             "repo_path": repo_path,
             "wiki_path": wiki_path,
             "repo_info": repo_info,
+            "basic_repo_structure": basic_repo_structure,
             "repo_structure": repo_structure,
         }
 
@@ -178,6 +163,13 @@ class ParentGraphBuilder:
         repo = state.get("repo")
         platform = state.get("platform", "github")
         mode = state.get("mode", "fast")
+        ratios = state.get(
+            "ratios",
+            {
+                "fast": 0.25,
+                "smart": 0.75,
+            },
+        )
         max_workers = state.get("max_workers", 10)
         date = state.get("date", datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
         log = state.get("log", False)
@@ -198,6 +190,7 @@ class ParentGraphBuilder:
             repo,
             platform,
             mode,
+            ratios,
             max_workers,
             repo_root_path,
             wiki_root_path,
@@ -212,6 +205,7 @@ class ParentGraphBuilder:
         )
 
         repo_info = get_repo_info(owner, repo, platform=platform)
+        basic_repo_structure = get_basic_repo_structure(repo_path)
         repo_structure = get_repo_structure(repo_path)
 
         print(f"✓ [basic_info_node] repository initialized")
@@ -221,10 +215,12 @@ class ParentGraphBuilder:
             repo=repo,
             platform=platform,
             mode=mode,
+            ratios=ratios,
             max_workers=max_workers,
             date=date,
             log=log,
             repo_info=repo_info,
+            basic_repo_structure=basic_repo_structure,
             repo_structure=repo_structure,
             repo_root_path=repo_root_path,
             wiki_root_path=wiki_root_path,
@@ -519,7 +515,7 @@ class ParentGraphBuilder:
 
 if __name__ == "__main__":
     # use "uv run python -m agents.sub_graph.parent" to run this file
-    parent_graph_builder = ParentGraphBuilder(branch_mode="all")
+    parent_graph_builder = ParentGraphBuilder(branch_mode="repo")
     date = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     parent_graph_builder.run(
         inputs={
@@ -527,7 +523,11 @@ if __name__ == "__main__":
             "repo": "zstd",
             "platform": "github",
             "mode": "fast",  # "fast" or "smart"
-            "max_workers": 50,  # 20 worker -> 3 - 4 minutes
+            "ratios": {
+                "fast": 0.05,
+                "smart": 0.75,
+            },
+            "max_workers": 10,
             "date": date,
             "log": False,
         },

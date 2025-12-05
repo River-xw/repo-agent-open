@@ -1,31 +1,19 @@
 from typing_extensions import TypedDict
-from langgraph.checkpoint.memory import MemorySaver
-from langchain_core.runnables.graph import MermaidDrawMethod
 from langgraph.graph.state import StateGraph, START
-from langchain_core.messages import HumanMessage, SystemMessage
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
-import time
 
-from utils.repo import (
-    get_repo_info,
-    get_repo_commit_info,
-    get_commits,
-    get_pr,
-    get_pr_files,
-    get_release_note,
+from utils.file import write_file, read_file, resolve_path
+from .utils import (
+    log_state,
+    call_llm,
+    curl_content,
+    get_md_files,
+    count_tokens,
+    get_llm_max_tokens,
 )
-from utils.file import (
-    get_repo_structure,
-    write_file,
-    read_file,
-    resolve_path,
-    read_json,
-)
-from .utils import draw_graph, log_state
+from .prompt import RepoPrompt
 from config import CONFIG
 
 
@@ -45,256 +33,110 @@ class RepoInfoSubGraphBuilder:
     def __init__(self):
         self.graph = self.build()
 
-    @staticmethod
-    def _get_system_prompt():
-        # this func is to get the system prompt for the repo info subgraph
-        return SystemMessage(
-            content="""You are an expert technical documentation writer specializing in generating comprehensive repository documentation. 
-Your role is to analyze provided repository data and create clear, well-structured documentation that helps developers understand the project's history, development process, and releases.
-
-Guidelines:
-- Use Markdown formatting for better readability
-- Be concise yet informative
-- Highlight key changes and their impact
-- Organize information logically with clear sections
-- Include relevant metrics and statistics when available
-
-CRITICAL OUTPUT RULES:
-- Output ONLY the markdown document content, starting directly with the title (e.g., # Title)
-- Do NOT include any introductory phrases, explanations, or closing remarks
-- Do NOT add text like "Of course", "Here is", "I'll generate", or any conversational preambles
-- The response must begin with the markdown title and end with the last content line
-- No meta-commentary, generation notes, or additional context outside the markdown content"""
-        )
-
-    @staticmethod
-    def _get_overview_doc_prompt(repo_info: dict, doc_contents: str) -> HumanMessage:
-        # this func is to generate a prompt for overall repository documentation
-        repo_name = repo_info.get("repo", "")
-        owner = repo_info.get("owner", "")
-
-        return HumanMessage(
-            content=f"""Generate overall repository documentation for the repository '{owner}/{repo_name}'.
-Based on the following repository information and documentation source files, create a detailed analysis that includes:
-1. Overview of the repository structure and key components
-2. Summary of existing documentation and its coverage
-3. Identification of documentation gaps and areas for improvement
-4. Architecture visualization using Mermaid diagrams (include at least one of the following):
-   - System architecture diagram (graph/flowchart)
-   - Component relationships diagram
-   - Module dependency diagram
-   - Data flow diagram
-   Use Mermaid markdown syntax (```mermaid ... ```) to create clear, informative diagrams
-
-Repository Information:
-{repo_info}
-
-Documentation Source Files Content:
-{doc_contents}
-
-Please structure the documentation with clear sections and make it suitable for both new contributors and project maintainers. Include Mermaid diagrams to visualize the repository architecture and component relationships.
-
-CRITICAL OUTPUT REQUIREMENTS:
-- Output ONLY the markdown document content starting with the title (e.g., # Title)
-- Do NOT include any introductory text, explanations, or closing remarks before or after the markdown content
-- Do NOT include phrases like "Of course", "Here is", "I'll generate", or any similar conversational text
-- The output should start directly with the markdown title and end with the last content line
-- No meta-commentary or generation information should be included"""
-        )
-
-    @staticmethod
-    def _get_updated_overview_doc_prompt(
+    def _select_doc_dirs(
+        self,
         repo_info: dict,
-        commit_info: dict,
-        pr_info: dict,
-        release_note_info: dict,
-        overview_doc_path: str,
-    ) -> HumanMessage:
-        # this func is to generate a prompt for updated overall repository documentation
-        repo_name = repo_info.get("repo", "")
-        owner = repo_info.get("owner", "")
-        return HumanMessage(
-            content=f"""The overall repository documentation for the repository '{owner}/{repo_name}' needs to be updated based on new commit, PR, and release note information. The previous documentation can be found at '{overview_doc_path}'.
-Based on the following updated information, please update the existing documentation to reflect the latest changes. Ensure that the documentation remains comprehensive and well-structured.
+        basic_repo_structure: list[str],
+        max_num_dirs: int = 100,
+    ) -> list[str]:
+        # call llm to select the dirs that are deserving to be the documentation source dirs
+        if not basic_repo_structure:
+            return []
 
-Updated Commit Information:
-{commit_info}
-
-Updated PR Information:
-{pr_info}
-
-Updated Release Note Information:
-{release_note_info}
-
-Please structure the documentation with clear sections and make it suitable for both new contributors and project maintainers. 
-
-IMPORTANT: Update or add Mermaid diagrams to reflect any architectural changes:
-- Update existing Mermaid diagrams if the architecture has changed
-- Add new diagrams (system architecture, component relationships, module dependencies, data flow) if needed
-- Use Mermaid markdown syntax (```mermaid ... ```) to visualize the updated repository structure and changes
-- Highlight new components or modified relationships in the diagrams
-
-CRITICAL OUTPUT REQUIREMENTS:
-- Output ONLY the markdown document content starting with the title (e.g., # Title)
-- Do NOT include any introductory text, explanations, or closing remarks before or after the markdown content
-- Do NOT include phrases like "Of course", "Here is", "I'll generate", or any similar conversational text
-- The output should start directly with the markdown title and end with the last content line
-- No meta-commentary or generation information should be included"""
+        raw_output = call_llm(
+            [
+                RepoPrompt._get_system_prompt_for_repo(),
+                RepoPrompt._get_human_prompt_for_repo_overview_dir_selection(
+                    repo_info, basic_repo_structure, max_num_dirs
+                ),
+            ]
         )
+        chosen_dirs: list[str] = []
+        if raw_output:
+            for line in str(raw_output).splitlines():
+                path = line.strip()
+                if not path:
+                    continue
+                # only accept the dirs that are in the basic_repo_structure and not already chosen
+                if path in basic_repo_structure and path not in chosen_dirs:
+                    chosen_dirs.append(path)
 
-    @staticmethod
-    def _generate_commit_doc_prompt(commit_info: dict, repo_info: dict) -> HumanMessage:
-        # this func is to generate a prompt for commit documentation
-        repo_name = repo_info.get("repo", "")
-        owner = repo_info.get("owner", "")
+        return chosen_dirs
 
-        return HumanMessage(
-            content=f"""Generate comprehensive commit history documentation for the repository '{owner}/{repo_name}'.
+    def _generate_single_overview_section(
+        self, repo_info: dict, selected_md_file: str
+    ) -> str:
+        # count the tokens of the selected_md_file
+        # if the tokens is greater than 5% of the max tokens, call llm to generate the overview section for the single module
+        # otherwise, return the content of the selected_md_file
+        doc_contents = read_file(selected_md_file) or ""
+        doc_contents_tokens = count_tokens(doc_contents)
+        if doc_contents_tokens > get_llm_max_tokens(compress_ratio=0.05):
+            result = call_llm(
+                [
+                    RepoPrompt._get_system_prompt_for_repo(),
+                    RepoPrompt._get_human_prompt_for_repo_single_module_overview(
+                        repo_info, selected_md_file, doc_contents
+                    ),
+                ]
+            )
+        else:
+            result = doc_contents
 
-Based on the following commit information, create a detailed analysis that includes:
-1. Summary of key commits and their purposes
-2. Patterns in development activity (frequency, authors, etc.)
-3. Major features or fixes identified in recent commits
-4. Development trends and insights
+        return result
 
-Commit Information:
-{commit_info}
+    def _build_overview_doc(
+        self,
+        repo_info: dict,
+        repo_path: str,
+        basic_repo_structure: list[str],
+        selected_doc_dirs: list[str],
+        max_workers: int,
+    ) -> str:
+        # use threadpool to generate the overview sections for the selected dirs in parallel
+        # combine the overview sections into the overview documentation
+        if not selected_doc_dirs:
+            return ""
 
-Please structure the documentation with clear sections and make it suitable for both new contributors and project maintainers.
+        # collect the md files in the selected dirs (deal with paths correctly)
+        selected_md_files = []
+        for selected_doc_dir in selected_doc_dirs:
+            doc_dir_abs_path = os.path.join(repo_path, selected_doc_dir)
+            doc_files = get_md_files(doc_dir_abs_path)
+            for doc_file in doc_files:
+                selected_md_files.append(os.path.join(doc_dir_abs_path, doc_file))
 
-CRITICAL OUTPUT REQUIREMENTS:
-- Output ONLY the markdown document content starting with the title (e.g., # Title)
-- Do NOT include any introductory text, explanations, or closing remarks before or after the markdown content
-- Do NOT include phrases like "Of course", "Here is", "I'll generate", or any similar conversational text
-- The output should start directly with the markdown title and end with the last content line
-- No meta-commentary or generation information should be included"""
+        # generate the overview sections for the selected md files in parallel
+        effective_workers = min(max_workers, len(selected_md_files))
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            futures = [
+                executor.submit(
+                    self._generate_single_overview_section,
+                    repo_info=repo_info,
+                    selected_md_file=selected_md_file,
+                )
+                for selected_md_file in selected_md_files
+            ]
+            module_sections = [f.result() for f in futures]
+
+        module_sections = [s.strip() for s in module_sections if s and s.strip()]
+        if not module_sections:
+            return ""
+
+        combined_module_overview = "\n\n".join(module_sections)
+
+        # call llm to generate the overview documentation for the selected dirs
+        final_overview = call_llm(
+            [
+                RepoPrompt._get_system_prompt_for_repo(),
+                RepoPrompt._get_human_prompt_for_repo_overview_doc(
+                    repo_info,
+                    combined_module_overview,
+                    basic_repo_structure,
+                ),
+            ]
         )
-
-    @staticmethod
-    def _generate_updated_commit_doc_prompt(
-        commit_info: dict, repo_info: dict, commit_doc_path: str
-    ) -> HumanMessage:
-        # this func is to generate a prompt for updated commit documentation
-        repo_name = repo_info.get("repo", "")
-        owner = repo_info.get("owner", "")
-        return HumanMessage(
-            content=f"""The commit history documentation for the repository '{owner}/{repo_name}' needs to be updated based on new commit information. The previous documentation can be found at '{commit_doc_path}'.
-Based on the following updated commit information, please update the existing documentation to reflect the latest changes. Ensure that the documentation remains comprehensive and well-structured.
-Updated Commit Information:
-{commit_info}
-Please structure the documentation with clear sections and make it suitable for both new contributors and project maintainers.
-
-CRITICAL OUTPUT REQUIREMENTS:
-- Output ONLY the markdown document content starting with the title (e.g., # Title)
-- Do NOT include any introductory text, explanations, or closing remarks before or after the markdown content
-- Do NOT include phrases like "Of course", "Here is", "I'll generate", or any similar conversational text
-- The output should start directly with the markdown title and end with the last content line
-- No meta-commentary or generation information should be included"""
-        )
-
-    @staticmethod
-    def _generate_pr_doc_prompt(pr_info: dict, repo_info: dict) -> HumanMessage:
-        # this func is to generate a prompt for PR documentation
-        repo_name = repo_info.get("repo", "")
-        owner = repo_info.get("owner", "")
-
-        return HumanMessage(
-            content=f"""Generate comprehensive pull request (PR) analysis documentation for the repository '{owner}/{repo_name}'.
-
-Based on the following PR information, create a detailed analysis that includes:
-1. Overview of active and recent pull requests
-2. Common themes or areas of focus in PRs
-3. Review and merge patterns
-4. Contributor activity and collaboration insights
-5. Any pending or long-standing PRs that need attention
-
-PR Information:
-{pr_info}
-
-Please structure the documentation with clear sections and highlight any important patterns or trends.
-
-CRITICAL OUTPUT REQUIREMENTS:
-- Output ONLY the markdown document content starting with the title (e.g., # Title)
-- Do NOT include any introductory text, explanations, or closing remarks before or after the markdown content
-- Do NOT include phrases like "Of course", "Here is", "I'll generate", or any similar conversational text
-- The output should start directly with the markdown title and end with the last content line
-- No meta-commentary or generation information should be included"""
-        )
-
-    @staticmethod
-    def _generate_updated_pr_doc_prompt(
-        pr_info: dict, repo_info: dict, pr_doc_path: str
-    ) -> HumanMessage:
-        # this func is to generate a prompt for updated PR documentation
-        repo_name = repo_info.get("repo", "")
-        owner = repo_info.get("owner", "")
-        return HumanMessage(
-            content=f"""The pull request (PR) analysis documentation for the repository '{owner}/{repo_name}' needs to be updated based on new PR information. The previous documentation can be found at '{pr_doc_path}'.
-Based on the following updated PR information, please update the existing documentation to reflect the latest changes. Ensure that the documentation remains comprehensive and well-structured.
-Updated PR Information:
-{pr_info}
-Please structure the documentation with clear sections and highlight any important patterns or trends.
-
-CRITICAL OUTPUT REQUIREMENTS:
-- Output ONLY the markdown document content starting with the title (e.g., # Title)
-- Do NOT include any introductory text, explanations, or closing remarks before or after the markdown content
-- Do NOT include phrases like "Of course", "Here is", "I'll generate", or any similar conversational text
-- The output should start directly with the markdown title and end with the last content line
-- No meta-commentary or generation information should be included"""
-        )
-
-    @staticmethod
-    def _generate_release_note_doc_prompt(
-        release_note_info: dict, repo_info: dict
-    ) -> HumanMessage:
-        # this func is to generate a prompt for release note documentation
-        repo_name = repo_info.get("repo", "")
-        owner = repo_info.get("owner", "")
-
-        return HumanMessage(
-            content=f"""Generate comprehensive release history documentation for the repository '{owner}/{repo_name}'.
-
-Based on the following release note information, create a detailed analysis that includes:
-1. Timeline of major releases and their key features
-2. Breaking changes and migration guides
-3. Performance improvements and bug fixes across versions
-4. Deprecations and future direction indicators
-5. Release frequency and versioning patterns
-
-Release Information:
-{release_note_info}
-
-Please structure the documentation with clear sections and make it suitable for users planning upgrades.
-
-CRITICAL OUTPUT REQUIREMENTS:
-- Output ONLY the markdown document content starting with the title (e.g., # Title)
-- Do NOT include any introductory text, explanations, or closing remarks before or after the markdown content
-- Do NOT include phrases like "Of course", "Here is", "I'll generate", or any similar conversational text
-- The output should start directly with the markdown title and end with the last content line
-- No meta-commentary or generation information should be included"""
-        )
-
-    @staticmethod
-    def _generate_updated_release_note_doc_prompt(
-        release_note_info: dict, repo_info: dict, release_note_doc_path: str
-    ) -> HumanMessage:
-        # this func is to generate a prompt for updated release note documentation
-        repo_name = repo_info.get("repo", "")
-        owner = repo_info.get("owner", "")
-        return HumanMessage(
-            content=f"""The release history documentation for the repository '{owner}/{repo_name}' needs to be updated based on new release note information. The previous documentation can be found at '{release_note_doc_path}'.
-Based on the following updated release note information, please update the existing documentation to reflect the latest changes. Ensure that the documentation remains comprehensive and well-structured.
-Updated Release Note Information:
-{release_note_info}
-Please structure the documentation with clear sections and make it suitable for users planning upgrades.
-
-CRITICAL OUTPUT REQUIREMENTS:
-- Output ONLY the markdown document content starting with the title (e.g., # Title)
-- Do NOT include any introductory text, explanations, or closing remarks before or after the markdown content
-- Do NOT include phrases like "Of course", "Here is", "I'll generate", or any similar conversational text
-- The output should start directly with the markdown title and end with the last content line
-- No meta-commentary or generation information should be included"""
-        )
+        return final_overview or combined_module_overview
 
     def repo_info_overview_node(self, state: dict):
         # this node is to process the overall repository documentation
@@ -302,61 +144,60 @@ CRITICAL OUTPUT REQUIREMENTS:
         print("→ [repo_info_overview_node] processing overview documentation...")
         basic_info_for_repo = state.get("basic_info_for_repo", {})
         commits_updated = basic_info_for_repo.get("commits_updated", False)
-        prs_updated = basic_info_for_repo.get("prs_updated", False)
-        releases_updated = basic_info_for_repo.get("releases_updated", False)
         commit_info = state.get("commit_info", {})
-        pr_info = state.get("pr_info", {})
-        release_note_info = state.get("release_note_info", {})
         repo_info = basic_info_for_repo.get("repo_info", {})
-        repo_structure = basic_info_for_repo.get("repo_structure", [])
+        repo_path = basic_info_for_repo.get("repo_path", "")
+        basic_repo_structure = basic_info_for_repo.get("basic_repo_structure", []) or []
+        max_workers = basic_info_for_repo.get("max_workers", 10)
+
         overview_doc_path = basic_info_for_repo.get("overview_doc_path", "")
         os.makedirs(os.path.dirname(overview_doc_path), exist_ok=True)
 
-        system_prompt = self._get_system_prompt()
-        llm = CONFIG.get_llm()
-        overview_info = ""
-        if commits_updated or prs_updated or releases_updated:
+        result_info = ""
+        if commits_updated:
             print(
                 "   → [repo_info_overview_node] generating overall documentation with updates..."
             )
-            human_prompt = self._get_updated_overview_doc_prompt(
-                repo_info, commit_info, pr_info, release_note_info, overview_doc_path
+            result_info = call_llm(
+                [
+                    RepoPrompt._get_system_prompt_for_repo(),
+                    RepoPrompt._get_human_prompt_for_repo_updated_overview_doc(
+                        repo_info,
+                        commit_info,
+                        overview_doc_path,
+                    ),
+                ]
             )
-            response = llm.invoke([system_prompt, human_prompt])
-            overview_info = response.content
             print("   → [repo_info_overview_node] overall documentation updated")
         elif os.path.exists(overview_doc_path):
             print(
                 "   → [repo_info_overview_node] overall documentation is up-to-date. No updates needed."
             )
             existing_content = read_file(overview_doc_path) or ""
-            overview_info = existing_content
+            result_info = existing_content
         else:
             print(
                 "   → [repo_info_overview_node] generating overall documentation without updates..."
             )
-            doc_source_files = [
-                file_path for file_path in repo_structure if file_path.endswith(".md")
-            ]
-            doc_contents = []
-            for file_path in doc_source_files:
-                file_path = resolve_path(file_path)
-                content = read_file(file_path)
-                if content:
-                    doc_contents.append(f"# Source File: {file_path}\n\n{content}\n\n")
-            combined_doc_content = "\n".join(doc_contents)
-            human_prompt = self._get_overview_doc_prompt(
-                repo_info, combined_doc_content
+            selected_doc_dirs = self._select_doc_dirs(
+                repo_info=repo_info,
+                basic_repo_structure=basic_repo_structure,
+                max_num_dirs=100,
             )
-            response = llm.invoke([system_prompt, human_prompt])
-            overview_info = response.content
+            result_info = self._build_overview_doc(
+                repo_info=repo_info,
+                repo_path=repo_path,
+                basic_repo_structure=basic_repo_structure,
+                selected_doc_dirs=selected_doc_dirs,
+                max_workers=max_workers,
+            )
             print("   → [repo_info_overview_node] overall documentation generated")
 
         print(
             "✓ [repo_info_overview_node] overall documentation processed successfully"
         )
         return {
-            "overview_info": overview_info,
+            "overview_info": result_info,
         }
 
     def overview_doc_generation_node(self, state: dict):
@@ -377,27 +218,80 @@ CRITICAL OUTPUT REQUIREMENTS:
             "✓ [overview_doc_generation_node] overview documentation processed successfully"
         )
 
+    def _generate_single_commit_section(
+        self,
+        single_commit: dict,
+        commit_repo_info: dict,
+    ) -> str:
+        return call_llm(
+            [
+                RepoPrompt._get_system_prompt_for_repo(),
+                RepoPrompt._get_human_prompt_for_repo_single_commit_doc(
+                    single_commit, commit_repo_info
+                ),
+            ]
+        )
+
+    def _build_commit_doc(
+        self,
+        commit_info: dict,
+        max_workers: int,
+        prefix_content: str | None = None,
+    ) -> str:
+        commits = commit_info.get("commits", []) or []
+        commit_repo_info = commit_info.get("repo_info", {})
+        if not commits:
+            return prefix_content or ""
+
+        effective_workers = min(max_workers, len(commits))
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            futures = [
+                executor.submit(
+                    self._generate_single_commit_section,
+                    single_commit=commit,
+                    commit_repo_info=commit_repo_info,
+                )
+                for commit in commits
+            ]
+            sections = [f.result() for f in futures]
+
+        combined = "\n\n".join(section.strip() for section in sections if section)
+
+        parts: list[str] = []
+        if prefix_content:
+            parts.append(prefix_content.rstrip())
+        if combined:
+            parts.append(combined)
+        return "\n\n".join(parts)
+
     def commit_doc_generation_node(self, state: dict):
         # this node is to process the commit documentation
         log_state(state)
         print("→ [commit_doc_generation_node] processing commit documentation...")
         basic_info_for_repo = state.get("basic_info_for_repo", {})
-        repo_info = state.get("repo_info", {})
         commit_info = state.get("commit_info", {})
         commits_updated = basic_info_for_repo.get("commits_updated", False)
         commit_doc_path = basic_info_for_repo.get("commit_doc_path", "")
+        max_workers = basic_info_for_repo.get("max_workers", 10)
         os.makedirs(os.path.dirname(commit_doc_path), exist_ok=True)
 
-        system_prompt = self._get_system_prompt()
-        llm = CONFIG.get_llm()
+        result_info = ""
+
         if commits_updated:
             print(
-                "   → [commit_doc_generation_node] generating commit documentation with updates..."
+                "   → [commit_doc_generation_node] generating commit documentation for updated commits in parallel..."
             )
-            human_prompt = self._generate_updated_commit_doc_prompt(
-                commit_info, repo_info, commit_doc_path
+            existing_content = ""
+            if os.path.exists(commit_doc_path):
+                existing_content = read_file(commit_doc_path) or ""
+                print(
+                    "   → [commit_doc_generation_node] existing commit documentation found, new sections will be appended."
+                )
+            result_info = self._build_commit_doc(
+                commit_info=commit_info,
+                max_workers=max_workers,
+                prefix_content=existing_content,
             )
-            response = llm.invoke([system_prompt, human_prompt])
             print("   → [commit_doc_generation_node] commit documentation updated")
         elif os.path.exists(commit_doc_path):
             print(
@@ -406,10 +300,13 @@ CRITICAL OUTPUT REQUIREMENTS:
             return
         else:
             print(
-                "   → [commit_doc_generation_node] generating commit documentation without updates..."
+                "   → [commit_doc_generation_node] generating commit documentation for all commits in parallel..."
             )
-            human_prompt = self._generate_commit_doc_prompt(commit_info, repo_info)
-            response = llm.invoke([system_prompt, human_prompt])
+            result_info = self._build_commit_doc(
+                commit_info=commit_info,
+                max_workers=max_workers,
+                prefix_content=None,
+            )
             print("   → [commit_doc_generation_node] commit documentation generated")
 
         print(
@@ -417,11 +314,64 @@ CRITICAL OUTPUT REQUIREMENTS:
         )
         write_file(
             commit_doc_path,
-            response.content,
+            result_info,
         )
         print(
             "✓ [commit_doc_generation_node] commit documentation processed successfully"
         )
+
+    def _generate_single_pr_section(
+        self,
+        single_pr: dict,
+        repo_info: dict,
+    ) -> str:
+        diff_url = single_pr.get("diff_url") or ""
+        diff_content = ""
+        if diff_url:
+            try:
+                diff_content = curl_content(diff_url)
+            except Exception:
+                diff_content = ""
+        return call_llm(
+            [
+                RepoPrompt._get_system_prompt_for_repo(),
+                RepoPrompt._get_human_prompt_for_repo_single_pr_doc(
+                    single_pr, repo_info, diff_content
+                ),
+            ]
+        )
+
+    def _build_pr_doc(
+        self,
+        pr_info: dict,
+        max_workers: int,
+        prefix_content: str | None = None,
+    ) -> str:
+        prs = pr_info.get("prs", []) or []
+        repo_info = pr_info.get("repo_info") or {}
+        if not prs:
+            return prefix_content or ""
+
+        effective_workers = min(max_workers, len(prs))
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            futures = [
+                executor.submit(
+                    self._generate_single_pr_section,
+                    single_pr=pr,
+                    repo_info=repo_info,
+                )
+                for pr in prs
+            ]
+            sections = [f.result() for f in futures]
+
+        combined = "\n\n".join(section.strip() for section in sections if section)
+
+        parts: list[str] = []
+        if prefix_content:
+            parts.append(prefix_content.rstrip())
+        if combined:
+            parts.append(combined)
+        return "\n\n".join(parts)
 
     def pr_doc_generation_node(self, state: dict):
         # this node is to process the PR documentation
@@ -432,18 +382,27 @@ CRITICAL OUTPUT REQUIREMENTS:
         repo_info = basic_info_for_repo.get("repo_info", {})
         prs_updated = basic_info_for_repo.get("prs_updated", False)
         pr_doc_path = basic_info_for_repo.get("pr_doc_path", "")
+        max_workers = basic_info_for_repo.get("max_workers", 10)
         os.makedirs(os.path.dirname(pr_doc_path), exist_ok=True)
 
-        system_prompt = self._get_system_prompt()
-        llm = CONFIG.get_llm()
+        result_info = ""
         if prs_updated:
             print(
-                "   → [pr_doc_generation_node] generating PR documentation with updates..."
+                "   → [pr_doc_generation_node] generating PR documentation for updated PRs in parallel..."
             )
-            human_prompt = self._generate_updated_pr_doc_prompt(
-                pr_info, repo_info, pr_doc_path
+            existing_content = ""
+            if os.path.exists(pr_doc_path):
+                existing_content = read_file(pr_doc_path) or ""
+                print(
+                    "   → [pr_doc_generation_node] existing PR documentation found, new sections will be appended."
+                )
+            # Ensure pr_info carries repo_info for prompt context
+            enriched_pr_info = {**pr_info, "repo_info": repo_info}
+            result_info = self._build_pr_doc(
+                pr_info=enriched_pr_info,
+                max_workers=max_workers,
+                prefix_content=existing_content,
             )
-            response = llm.invoke([system_prompt, human_prompt])
             print("   → [pr_doc_generation_node] PR documentation updated")
         elif os.path.exists(pr_doc_path):
             print(
@@ -452,18 +411,68 @@ CRITICAL OUTPUT REQUIREMENTS:
             return
         else:
             print(
-                "   → [pr_doc_generation_node] generating PR documentation without updates..."
+                "   → [pr_doc_generation_node] generating PR documentation for all PRs in parallel..."
             )
-            human_prompt = self._generate_pr_doc_prompt(pr_info, repo_info)
-            response = llm.invoke([system_prompt, human_prompt])
+            enriched_pr_info = {**pr_info, "repo_info": repo_info}
+            result_info = self._build_pr_doc(
+                pr_info=enriched_pr_info,
+                max_workers=max_workers,
+                prefix_content=None,
+            )
             print("   → [pr_doc_generation_node] PR documentation generated")
 
         print(f"   → [pr_doc_generation_node] writing PR info to {pr_doc_path}")
         write_file(
             pr_doc_path,
-            response.content,
+            result_info,
         )
         print("✓ [pr_doc_generation_node] PR documentation processed successfully")
+
+    def _generate_single_release_section(
+        self,
+        single_release: dict,
+        repo_info: dict,
+    ) -> str:
+        return call_llm(
+            [
+                RepoPrompt._get_system_prompt_for_repo(),
+                RepoPrompt._get_human_prompt_for_repo_single_release_doc(
+                    single_release, repo_info
+                ),
+            ]
+        )
+
+    def _build_release_note_doc(
+        self,
+        release_note_info: dict,
+        max_workers: int,
+        prefix_content: str | None = None,
+    ) -> str:
+        releases = release_note_info.get("releases", []) or []
+        repo_info = release_note_info.get("repo_info") or {}
+        if not releases:
+            return prefix_content or ""
+
+        effective_workers = min(max_workers, len(releases))
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            futures = [
+                executor.submit(
+                    self._generate_single_release_section,
+                    single_release=release,
+                    repo_info=repo_info,
+                )
+                for release in releases
+            ]
+            sections = [f.result() for f in futures]
+
+        combined = "\n\n".join(section.strip() for section in sections if section)
+
+        parts: list[str] = []
+        if prefix_content:
+            parts.append(prefix_content.rstrip())
+        if combined:
+            parts.append(combined)
+        return "\n\n".join(parts)
 
     def release_note_doc_generation_node(self, state: dict):
         # this node is to process the release note documentation
@@ -476,18 +485,26 @@ CRITICAL OUTPUT REQUIREMENTS:
         release_note_info = state.get("release_note_info", {})
         repo_info = basic_info_for_repo.get("repo_info", {})
         release_note_doc_path = basic_info_for_repo.get("release_note_doc_path", "")
+        max_workers = basic_info_for_repo.get("max_workers", 10)
         os.makedirs(os.path.dirname(release_note_doc_path), exist_ok=True)
 
-        system_prompt = self._get_system_prompt()
-        llm = CONFIG.get_llm()
+        result_info = ""
         if releases_updated:
             print(
-                "   → [release_note_doc_generation_node] generating release note documentation with updates..."
+                "   → [release_note_doc_generation_node] generating release note documentation for updated releases in parallel..."
             )
-            human_prompt = self._generate_updated_release_note_doc_prompt(
-                release_note_info, repo_info, release_note_doc_path
+            existing_content = ""
+            if os.path.exists(release_note_doc_path):
+                existing_content = read_file(release_note_doc_path) or ""
+                print(
+                    "   → [release_note_doc_generation_node] existing release note documentation found, new sections will be appended."
+                )
+            enriched_release_note_info = {**release_note_info, "repo_info": repo_info}
+            result_info = self._build_release_note_doc(
+                release_note_info=enriched_release_note_info,
+                max_workers=max_workers,
+                prefix_content=existing_content,
             )
-            response = llm.invoke([system_prompt, human_prompt])
             print(
                 "   → [release_note_doc_generation_node] release note documentation updated"
             )
@@ -498,14 +515,16 @@ CRITICAL OUTPUT REQUIREMENTS:
             return
         else:
             print(
-                "   → [release_note_doc_generation_node] Generating release note documentation without updates."
+                "   → [release_note_doc_generation_node] generating release note documentation for all releases in parallel..."
             )
-            human_prompt = self._generate_release_note_doc_prompt(
-                release_note_info, repo_info
+            enriched_release_note_info = {**release_note_info, "repo_info": repo_info}
+            result_info = self._build_release_note_doc(
+                release_note_info=enriched_release_note_info,
+                max_workers=max_workers,
+                prefix_content=None,
             )
-            response = llm.invoke([system_prompt, human_prompt])
             print(
-                "   → [release_note_doc_generation_node] Release note documentation generated"
+                "   → [release_note_doc_generation_node] release note documentation generated"
             )
 
         print(
@@ -513,7 +532,7 @@ CRITICAL OUTPUT REQUIREMENTS:
         )
         write_file(
             release_note_doc_path,
-            response.content,
+            result_info,
         )
         print(
             "✓ [release_note_doc_generation_node] release note documentation processed successfully"
