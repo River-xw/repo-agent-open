@@ -10,30 +10,66 @@
     />
 
     <div class="content-wrapper">
-      <TocSidebar
-        :sections="tocSections"
-        :selected-url="selectedUrl"
-        @item-click="handleItemClick"
-        @heading-click="handleHeadingClick"
-        @toggle="toggleItemExpand"
-      />
+      <!-- Always render the original content, but dim it when chat is visible -->
+      <div :class="[{ 'content-dim': chatVisible }, 'main-content']">
+        <TocSidebar
+          :sections="tocSections"
+          :selected-url="selectedUrl"
+          @item-click="handleItemClick"
+          @heading-click="handleHeadingClick"
+          @toggle="toggleItemExpand"
+        />
 
-      <DocContent
-        ref="docContentRef"
-        :content="docContent"
-        :is-streaming="isStreaming"
-        :progress-logs="progressLogs"
-        :progress="currentProgress"
-        :hasLoadedAnyFile="hasLoadedAnyFile"
+        <DocContent
+          ref="docContentRef"
+          :content="docContent"
+          :is-streaming="isStreaming"
+          :progress-logs="progressLogs"
+          :progress="currentProgress"
+          :hasLoadedAnyFile="hasLoadedAnyFile"
+        />
+      </div>
+
+      <!-- Chat overlays the content area when visible -->
+      <transition name="slide-up">
+        <div class="chat-replace" v-show="chatVisible">
+          <!-- v-show on overlay prevents blocking background interactions when hidden -->
+          <keep-alive>
+            <LargeChat
+              ref="largeChatRef"
+              :owner="owner"
+              :repo="repoName"
+              :platform="repoPlatform"
+              :mode="generationMode === 'moe' ? 'smart' : 'fast'"
+              @new-repo="handleNewRepo"
+              @streaming="(v) => (isChatStreaming = v)"
+            />
+          </keep-alive>
+        </div>
+      </transition>
+    </div>
+
+    <!-- Chat toggle button (Expand / Close) -->
+    <button
+      class="chat-toggle-btn"
+      @click="toggleChat"
+      :title="chatVisible ? 'Close Chat' : 'Expand Chat'"
+      :aria-pressed="chatVisible"
+    >
+      <span class="toggle-label">{{ chatVisible ? 'Close ↓' : 'Expand ↑' }}</span>
+    </button>
+
+    <div class="askbox-wrapper">
+      <AskBox
+        v-model="query"
+        :placeholder="placeholder"
+        :is-loading="isChatStreaming"
+        @send="handleSend"
+        @new-repo="handleNewRepo"
+        @abort="handleAbort"
       />
     </div>
 
-    <AskBox
-      v-model="query"
-      :placeholder="placeholder"
-      @send="handleSend"
-      @new-repo="handleNewRepo"
-    />
     <div
       v-if="zoomModalVisible"
       class="zoom-modal"
@@ -67,7 +103,13 @@ import RepoHeader from '../components/RepoHeader.vue'
 import TocSidebar from '../components/TocSidebar.vue'
 import DocContent from '../components/DocContent.vue'
 import AskBox from '../components/AskBox.vue'
-import { generateDocStream, getWikiFiles, resolveBackendStaticUrl, type BaseResponse } from '../utils/request'
+import LargeChat from '../components/LargeChat.vue'
+import {
+  generateDocStream,
+  getWikiFiles,
+  resolveBackendStaticUrl,
+  type BaseResponse,
+} from '../utils/request'
 import MarkdownIt from 'markdown-it'
 import anchor from 'markdown-it-anchor'
 import mermaid from 'mermaid'
@@ -118,9 +160,11 @@ const docContentRef = ref<InstanceType<typeof DocContent> | null>(null)
 const docContent = ref('<p>Select a repository to view documentation.</p>')
 const tocSections = ref<TocSection[]>([])
 const query = ref('')
+const largeChatRef = ref<InstanceType<typeof LargeChat> | null>(null)
 const selected = ref<{ section: number | null; item: number | null }>({ section: null, item: null })
 const selectedUrl = ref<string | null>(null)
 const isStreaming = ref(false)
+const isChatStreaming = ref(false)
 const progressLogs = ref<string[]>([])
 const streamController = ref<AbortController | null>(null)
 const currentProgress = ref<number>(0)
@@ -305,7 +349,9 @@ const md = new MarkdownIt({
     if (lang && hljs.getLanguage(lang)) {
       try {
         return `<pre class="hljs"><code>${hljs.highlight(str, { language: lang, ignoreIllegals: true }).value}</code></pre>`
-      } catch (__) {}
+      } catch (__) {
+        return `<pre class="hljs"><code>${escapeHtml(str)}</code></pre>`
+      }
     }
     return `<pre class="hljs"><code>${escapeHtml(str)}</code></pre>`
   },
@@ -444,6 +490,12 @@ const zoomStyle = computed(() => ({
   transformOrigin: 'center center',
   cursor: isDragging.value ? 'grabbing' : 'grab',
 }))
+
+// Chat overlay visibility
+const chatVisible = ref(false)
+const toggleChat = () => {
+  chatVisible.value = !chatVisible.value
+}
 
 const attachZoomListeners = () => {
   if (!docContentRef.value) return
@@ -589,7 +641,7 @@ async function loadDocumentation(section: TocSection, needUpdate = false) {
         }
 
         // Check for generation complete flag
-        if ((data as Record<string, unknown>)?. generation_complete === true) {
+        if ((data as Record<string, unknown>)?.generation_complete === true) {
           currentProgress.value = 100
           progressLogs.value.push('✅ Documentation generation complete')
           if (pollInterval.value) {
@@ -825,9 +877,9 @@ async function initializeDocumentation(section: TocSection) {
     progressLogs.value = ['Checking for existing documentation...']
     currentProgress.value = 10
     isStreaming.value = true
-    
+
     const response = await getWikiFiles(section.owner, section.repo, generationMode.value)
-    
+
     if (response.code === 200 && response.data.files.length > 0) {
       // Documentation exists, load it directly
       currentProgress.value = 100
@@ -994,11 +1046,28 @@ if (themeContext?.isDarkMode) {
 
 onMounted(async () => {
   updateHighlightStyle()
-  
+
   if (repoId.value && lastHandledRepoId !== repoId.value) {
     lastHandledRepoId = repoId.value
     selectRepoById(repoId.value)
   }
+
+  // Ensure chat storage is cleared on full page unload (reload/close)
+  const beforeUnloadHandler = () => {
+    try {
+      const key =
+        owner.value && repoName.value ? `largechat:${owner.value}:${repoName.value}` : null
+      if (key) sessionStorage.removeItem(key)
+    } catch (e) {
+      console.warn('[RepoDetail] clear sessionStorage on unload failed', e)
+    }
+  }
+  window.addEventListener('beforeunload', beforeUnloadHandler)
+
+  // store handler so we can remove it on unmount
+  ;(
+    window as unknown as { __repoDetail_beforeUnloadHandler?: () => void }
+  ).__repoDetail_beforeUnloadHandler = beforeUnloadHandler
 })
 
 onUnmounted(() => {
@@ -1010,6 +1079,22 @@ onUnmounted(() => {
   if (streamController.value) {
     streamController.value.abort()
     streamController.value = null
+  }
+  // Clear LargeChat sessionStorage for current repo when RepoDetail is destroyed
+  try {
+    const key = owner.value && repoName.value ? `largechat:${owner.value}:${repoName.value}` : null
+    if (key) sessionStorage.removeItem(key)
+  } catch (e) {
+    console.warn('[RepoDetail] clear sessionStorage on unmount failed', e)
+  }
+
+  // Remove beforeunload listener if added
+  const handler = (window as unknown as { __repoDetail_beforeUnloadHandler?: () => void })
+    .__repoDetail_beforeUnloadHandler
+  if (handler) {
+    window.removeEventListener('beforeunload', handler)
+    delete (window as unknown as { __repoDetail_beforeUnloadHandler?: () => void })
+      .__repoDetail_beforeUnloadHandler
   }
 })
 
@@ -1092,10 +1177,36 @@ const emit = defineEmits<{
   (e: 'navigateNewRepo'): void
 }>()
 
-const handleSend = () => {
+const handleSend = async () => {
   if (!query.value) return
-  emit('send', query.value)
+  const text = query.value
+  console.debug('[RepoDetail] handleSend called:', text)
+  emit('send', text)
   query.value = ''
+
+  // open chat panel and forward the message to LargeChat
+  chatVisible.value = true
+  await nextTick()
+  try {
+    const inst = largeChatRef.value as unknown as { receiveMessage?: (text: string) => void }
+    if (inst && typeof inst.receiveMessage === 'function') {
+      console.debug('[RepoDetail] forwarding to LargeChat.receiveMessage')
+      inst.receiveMessage(text)
+    }
+  } catch (err) {
+    console.warn('Failed to forward message to LargeChat', err)
+  }
+}
+
+const handleAbort = () => {
+  try {
+    const inst = largeChatRef.value as unknown as { abortStream?: () => void }
+    if (inst && typeof inst.abortStream === 'function') {
+      inst.abortStream()
+    }
+  } catch (err) {
+    console.warn('Failed to abort stream', err)
+  }
 }
 
 const handleNewRepo = () => {
@@ -1133,6 +1244,25 @@ const openRepoInNewTab = () => {
   max-width: 1340px;
   margin-left: auto;
   margin-right: auto;
+}
+
+/* Make wrapper a positioning context so chat overlay can absolutely cover it */
+.content-wrapper {
+  position: relative;
+}
+
+.main-content {
+  display: flex;
+  gap: 24px;
+  align-items: stretch;
+  height: 100%;
+  width: 100%;
+  transition: opacity 260ms ease;
+}
+
+.content-dim {
+  opacity: 0;
+  pointer-events: none;
 }
 
 .zoom-modal {
@@ -1184,5 +1314,83 @@ const openRepoInNewTab = () => {
 
 .close-zoom:hover {
   background: rgba(255, 255, 255, 0.4);
+}
+
+/* Chat overlay and toggle button */
+.chat-toggle-btn {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 75px; /* sits above the AskBox */
+  min-width: 160px;
+  height: 44px;
+  padding: 6px 18px;
+  border-radius: 10px;
+  background: var(--card-bg, #fff);
+  border: 1.5px solid var(--border-color, #123);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  color: var(--text-color);
+  z-index: 1201;
+  cursor: pointer;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.06);
+}
+.chat-toggle-btn:hover {
+  transform: translateX(-50%) scale(1.03);
+}
+
+.chat-toggle-btn .toggle-label {
+  display: inline-block;
+  font-weight: 600;
+}
+
+.chat-replace {
+  /* overlay the entire content-wrapper */
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  z-index: 1150;
+  pointer-events: auto;
+}
+
+/* Ensure AskBox sits above the chat overlay so it remains clickable */
+.askbox-wrapper {
+  position: relative;
+  pointer-events: auto;
+}
+
+/* Slide up / down animation similar to MacOS open/close */
+.slide-up-enter-from {
+  transform: translateY(100%);
+  opacity: 0;
+}
+.slide-up-enter-active {
+  transition:
+    transform 320ms cubic-bezier(0.2, 0.9, 0.2, 1),
+    opacity 240ms ease;
+}
+.slide-up-enter-to {
+  transform: translateY(0);
+  opacity: 1;
+}
+.slide-up-leave-from {
+  transform: translateY(0);
+  opacity: 1;
+}
+.slide-up-leave-active {
+  transition:
+    transform 260ms cubic-bezier(0.2, 0.9, 0.2, 1),
+    opacity 200ms ease;
+}
+.slide-up-leave-to {
+  transform: translateY(100%);
+  opacity: 0;
 }
 </style>
